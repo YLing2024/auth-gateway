@@ -16,6 +16,7 @@ import (
 	"strings"
 
 	"example.com/auth-gateway/internal/config"
+	"example.com/auth-gateway/internal/session"
 )
 
 // Identity is what the gateway asserts to the upstream.
@@ -91,7 +92,7 @@ func (h *Handler) newProxy(target *url.URL, injectBearer bool) *httputil.Reverse
 			stripIdentityHeaders(pr.Out.Header)
 			// 2) Strip the gateway's own session cookies.
 			if ck := pr.Out.Header.Get("Cookie"); ck != "" {
-				pr.Out.Header.Set("Cookie", stripCookies(ck, h.suffix))
+				pr.Out.Header.Set("Cookie", session.StripGatewayCookies(ck, h.suffix))
 			}
 			// 3) Inject the gateway's asserted identity.
 			if id, ok := IdentityFrom(pr.In); ok {
@@ -160,26 +161,4 @@ func stripIdentityHeaders(h http.Header) {
 	for _, name := range identityHeaders {
 		h.Del(name)
 	}
-}
-
-// stripCookies removes the gateway's session cookies, preserving any other
-// cookies the app set.
-func stripCookies(header, suffix string) string {
-	parts := strings.Split(header, ";")
-	kept := make([]string, 0, len(parts))
-	for _, p := range parts {
-		p = strings.TrimSpace(p)
-		if p == "" {
-			continue
-		}
-		name := p
-		if i := strings.IndexByte(p, '='); i >= 0 {
-			name = p[:i]
-		}
-		if strings.HasPrefix(name, "__Host-") && strings.HasSuffix(name, suffix) {
-			continue
-		}
-		kept = append(kept, p)
-	}
-	return strings.Join(kept, "; ")
 }
