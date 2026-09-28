@@ -33,6 +33,13 @@ apps:
     upstream: http://127.0.0.1:8000
     mode: protect
     secret_file: /etc/auth-gateway/android.secret
+    # 原生 APP/CLI 通道：额外接受客户端 Authorization: Bearer <access_token>。
+    # 默认 false（不写这两项时行为与旧版逐字节一致，受保护请求只认会话 cookie）。
+    # 本地 JWKS 验 ES256 签名并校验 iss/aud/exp/nbf/jti 撤销；失败一律 401 JSON，
+    # 不建不改任何 cookie；cookie 与 Bearer 同时存在时优先 cookie。
+    accept_bearer: true
+    # 缺省 = [android]；显式空数组会启动报错（绝不静默接受任意 aud）。
+    bearer_audiences: [android, home-android]
 
   - id: desktop
     hosts: [desktop.example.com]

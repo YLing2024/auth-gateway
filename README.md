@@ -32,6 +32,22 @@ cp config.example.yaml config.yaml   # 按部署环境填写
 - Redis：DB 默认 2，键带 `gw:` 前缀；`state` 一次性消费 TTL 10 分钟；会话 7 天滑动。
 - Token：AES-GCM 加密存放，密钥来自 0600 文件。
 
+## 两条身份通道：网页 cookie / 原生 APP Bearer
+
+同一个受保护路由同时支持两种调用方，二者都把身份映射为同一个上游头 `X-Auth-User`（值为 `sub`）：
+
+- **网页**：OIDC + PKCE 登录后由网关下发会话 cookie `__Host-<app>_session`，后续请求靠 cookie 认证。
+- **原生 APP / CLI**：无法共享浏览器 cookie store，走 PKCE + 系统安全存储，调用时携带
+  `Authorization: Bearer <access_token>`。按 app 用 `accept_bearer: true` 开启（默认 `false`）。
+  - 本地验签，不做逐请求 introspection：用 `/jwks.json` 公钥验 ES256，校验 `iss`、`aud`、
+    `exp`/`nbf`（含 `clock_skew_minutes`）与 `jti` 撤销；`alg` 必须是 ES256，拒绝 `none`/`HS*`。
+  - 通过后仅注入身份头，**不建、不改、不清任何 cookie**；失败一律 `401 JSON`（不 302，APP 不是浏览器）。
+  - `bearer_audiences` 缺省为 `[<app.id>]`，出现空数组直接启动报错（不会退化为接受任意 aud）。
+  - cookie 与 Bearer 同时存在时**优先 cookie**，浏览器行为不变。
+- 注意：这里的「接受客户端 Bearer」与 `mode: proxy` 的「向上游**注入** Bearer」（用会话里保存的
+  access_token）是两回事，开关各自独立，不要混用。
+- `auth: none` 的公开路由不注入身份头，即使带了合法 Bearer 也不认证；`/_auth/*` 行为不变。
+
 ## 离线自测
 
 `test/selftest.sh` 在回环地址上用私有端口 18930/18931/18932 与 Redis DB 2
@@ -40,6 +56,7 @@ cp config.example.yaml config.yaml   # 按部署环境填写
 ```sh
 bash test/selftest.sh
 bash test/private_scan.sh   # 仓库私有信息扫描，期望 0 命中
+bash test/legacy_ab.sh      # 老配置 A/B：改造前(9ef59dd) vs 当前，归一化输出必须完全一致
 go test ./...
 ```
 
