@@ -200,6 +200,86 @@ apps:
 	}
 }
 
+func TestAcceptBearerAudienceDefaultsAndValidation(t *testing.T) {
+	base := `
+listen: 127.0.0.1:18920
+issuer: https://auth.example.com
+redis:
+  addr: 127.0.0.1:6379
+audit:
+  file: /tmp/audit.log
+apps:
+  - id: q
+    hosts: [q.example.com]
+    upstream: http://127.0.0.1:5300
+    mode: protect
+    secret_file: %s
+%s
+`
+	t.Run("defaults to app id", func(t *testing.T) {
+		dir := t.TempDir()
+		secret := write(t, dir, "q.secret", "x")
+		body := strings.Replace(base, "%s", secret, 1)
+		body = strings.Replace(body, "%s", "    accept_bearer: true", 1)
+		cfg, err := loadYAML(t, body)
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		a := cfg.Apps[0]
+		if !a.AcceptBearer {
+			t.Fatal("accept_bearer not set")
+		}
+		if len(a.BearerAudiences) != 1 || a.BearerAudiences[0] != "q" {
+			t.Fatalf("bearer_audiences = %v, want [q]", a.BearerAudiences)
+		}
+	})
+	t.Run("explicit audiences preserved", func(t *testing.T) {
+		dir := t.TempDir()
+		secret := write(t, dir, "q.secret", "x")
+		body := strings.Replace(base, "%s", secret, 1)
+		body = strings.Replace(body, "%s", "    accept_bearer: true\n    bearer_audiences: [admin, home-admin]", 1)
+		cfg, err := loadYAML(t, body)
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		got := cfg.Apps[0].BearerAudiences
+		if len(got) != 2 || got[0] != "admin" || got[1] != "home-admin" {
+			t.Fatalf("bearer_audiences = %v, want [admin home-admin]", got)
+		}
+	})
+	t.Run("empty list is fatal", func(t *testing.T) {
+		dir := t.TempDir()
+		secret := write(t, dir, "q.secret", "x")
+		body := strings.Replace(base, "%s", secret, 1)
+		body = strings.Replace(body, "%s", "    accept_bearer: true\n    bearer_audiences: []", 1)
+		if _, err := loadYAML(t, body); err == nil {
+			t.Fatal("explicit empty bearer_audiences must be rejected")
+		}
+	})
+	t.Run("empty entry is fatal", func(t *testing.T) {
+		dir := t.TempDir()
+		secret := write(t, dir, "q.secret", "x")
+		body := strings.Replace(base, "%s", secret, 1)
+		body = strings.Replace(body, "%s", "    bearer_audiences: [\"\"]", 1)
+		if _, err := loadYAML(t, body); err == nil {
+			t.Fatal("empty bearer_audiences entry must be rejected")
+		}
+	})
+	t.Run("absent keeps safe default", func(t *testing.T) {
+		dir := t.TempDir()
+		secret := write(t, dir, "q.secret", "x")
+		body := strings.Replace(base, "%s", secret, 1)
+		body = strings.Replace(body, "%s", "", 1)
+		cfg, err := loadYAML(t, body)
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.Apps[0].AcceptBearer {
+			t.Fatal("accept_bearer must default to false")
+		}
+	})
+}
+
 func TestRoutesDuplicatePrefixRejected(t *testing.T) {
 	dir := t.TempDir()
 	secret := write(t, dir, "q.secret", "x")
