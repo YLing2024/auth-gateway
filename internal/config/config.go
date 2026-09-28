@@ -103,7 +103,6 @@ func Load(path string) (*Config, error) {
 	}
 	var c Config
 	dec := yaml.NewDecoder(strings.NewReader(string(raw)))
-	dec.KnownFields(false)
 	if err := dec.Decode(&c); err != nil {
 		return nil, fmt.Errorf("config: parse %s: %w", path, err)
 	}
