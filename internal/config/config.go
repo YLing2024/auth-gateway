@@ -101,8 +101,41 @@ type AppConfig struct {
 	SecretFile  string   `yaml:"secret_file"`
 	Routes      []Route  `yaml:"routes"`
 
+	// AcceptBearer makes protected requests accept a client-presented
+	// Authorization: Bearer access token (native app / CLI channel). Disabled
+	// by default so an app that omits the field behaves exactly as before.
+	AcceptBearer bool `yaml:"accept_bearer"`
+	// BearerAudiences are the aud values accepted for client bearer tokens.
+	// Absent means [app.id]; an explicitly empty list is a fatal config error
+	// (we never silently accept any audience).
+	BearerAudiences []string `yaml:"bearer_audiences"`
+
+	// bearerAudiencesSet records whether bearer_audiences appeared in the YAML,
+	// which distinguishes "absent" (default) from an explicit empty list.
+	bearerAudiencesSet bool
+
 	// ClientSecret is loaded from SecretFile, never serialized.
 	ClientSecret string `yaml:"-"`
+}
+
+// UnmarshalYAML decodes an app while remembering whether bearer_audiences was
+// present. A plain []string cannot tell absent from "[]", and the two must be
+// treated differently (default to [id] vs. a fatal error).
+func (a *AppConfig) UnmarshalYAML(value *yaml.Node) error {
+	type plain AppConfig // avoid recursing into this method
+	var p plain
+	if err := value.Decode(&p); err != nil {
+		return err
+	}
+	*a = AppConfig(p)
+	if value.Kind == yaml.MappingNode {
+		for i := 0; i+1 < len(value.Content); i += 2 {
+			if value.Content[i].Value == "bearer_audiences" {
+				a.bearerAudiencesSet = true
+			}
+		}
+	}
+	return nil
 }
 
 // Route is one path-prefix dispatch entry inside an app. The longest matching
@@ -296,6 +329,20 @@ func (c *Config) normalizeAndValidate() error {
 		}
 		if strings.TrimSpace(a.SecretFile) == "" {
 			errs = append(errs, fmt.Sprintf("app %q is missing secret_file", a.ID))
+		}
+
+		// Client bearer tokens: an absent audience list defaults to [app.id];
+		// an explicit empty list is rejected rather than accepting any aud.
+		if a.bearerAudiencesSet && len(a.BearerAudiences) == 0 {
+			errs = append(errs, fmt.Sprintf("app %q bearer_audiences must not be empty (omit the field to default to [%s])", a.ID, a.ID))
+		}
+		if !a.bearerAudiencesSet {
+			a.BearerAudiences = []string{a.ID}
+		}
+		for k, aud := range a.BearerAudiences {
+			if strings.TrimSpace(aud) == "" {
+				errs = append(errs, fmt.Sprintf("app %q bearer_audiences[%d] is empty", a.ID, k))
+			}
 		}
 	}
 	if needTokenKey && strings.TrimSpace(c.Token.EncryptionKeyFile) == "" {
