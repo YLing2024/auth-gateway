@@ -1,0 +1,69 @@
+# Auth Gateway 配置示例（复制为 config.yaml 使用；config.yaml 已被 .gitignore 忽略）
+# 仓库内**只能**出现示例值（example.com），真实域名/IP/密钥一律部署时注入。
+
+listen: 127.0.0.1:18920          # 仅本地监听；由 nginx 反代进来
+issuer: https://auth.example.com # SSO 认证中心；可用环境变量 GATEWAY_ISSUER 覆盖
+logout_redirect: "/"             # 登出后回哪里
+
+redis:
+  addr: 127.0.0.1:6379
+  db: 2                          # 专用 DB，勿与既有 DB 0 混用
+  password: ""                   # 留空表示无密码（仅本地监听时可接受）
+  prefix: "gw:"
+
+session:
+  state_ttl_minutes: 10          # 登录流程中间态
+  ttl_hours: 168                 # 会话 7 天滑动
+  cookie_suffix: "_session"      # 最终 cookie 名 = __Host-<app>_session
+
+token:
+  encryption_key_file: /etc/auth-gateway/token.key  # proxy 模式加密存放 token；0600
+  jwks_cache_hours: 24
+  clock_skew_minutes: 2
+
+audit:
+  file: /data/authgw/audit.log   # 不记 token / cookie 值
+  retention_days: 30
+
+# ── 站点清单（白名单：转发目标只能来自这里，绝不接受请求里的 URL）──
+apps:
+  # protect：只做登录 + 会话 + 放行静态/上游，不保存 token（泄漏面最小）
+  - id: android
+    hosts: [android.example.com]
+    upstream: http://127.0.0.1:8000
+    mode: protect
+    secret_file: /etc/auth-gateway/android.secret
+
+  - id: desktop
+    hosts: [desktop.example.com]
+    upstream: http://127.0.0.1:3999
+    mode: protect
+    secret_file: /etc/auth-gateway/desktop.secret
+
+  - id: linux
+    hosts: [linux.example.com]
+    upstream: http://127.0.0.1:7901
+    mode: protect
+    secret_file: /etc/auth-gateway/linux.secret
+
+  # proxy：额外保存 token，并把 Authorization 注入给 api_upstream
+  - id: quotahub
+    hosts: [quotahub.example.com]
+    upstream: http://127.0.0.1:5300
+    api_upstream: http://127.0.0.1:5300
+    mode: proxy
+    secret_file: /etc/auth-gateway/quotahub.secret
+
+  - id: v2
+    hosts: [v2.example.com]
+    upstream: http://127.0.0.1:7897
+    api_upstream: http://127.0.0.1:7897
+    mode: proxy
+    secret_file: /etc/auth-gateway/v2.secret
+
+  - id: admin
+    hosts: [admin.example.com]
+    upstream: http://127.0.0.1:3100
+    api_upstream: http://127.0.0.1:3100
+    mode: proxy
+    secret_file: /etc/auth-gateway/admin.secret
