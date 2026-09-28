@@ -120,3 +120,109 @@ func TestLoadKeyFromFile(t *testing.T) {
 		t.Fatal("missing key file must error, never fall back to plaintext")
 	}
 }
+
+const routesYAML = `
+listen: 127.0.0.1:18920
+issuer: https://auth.example.com
+redis:
+  addr: 127.0.0.1:6379
+audit:
+  file: /tmp/auth-gateway-test/audit.log
+apps:
+  - id: quotahub
+    hosts: [quotahub.example.com]
+    secret_file: %s
+    routes:
+      - prefix: /api/
+        upstream: http://127.0.0.1:5300
+        auth: required
+      - prefix: /
+        upstream: http://127.0.0.1:5300
+        auth: none
+`
+
+func TestRoutesAppNeedsNoAppLevelUpstream(t *testing.T) {
+	dir := t.TempDir()
+	secret := write(t, dir, "quotahub.secret", "shh")
+	cfg, err := loadYAML(t, strings.Replace(routesYAML, "%s", secret, 1))
+	if err != nil {
+		t.Fatalf("routes app without upstream/mode must load: %v", err)
+	}
+	a := cfg.Apps[0]
+	if len(a.Routes) != 2 {
+		t.Fatalf("routes = %d, want 2", len(a.Routes))
+	}
+	if a.Mode != ModeProtect {
+		t.Fatalf("mode = %q, want protect default", a.Mode)
+	}
+	if a.Routes[0].Auth != AuthRequired || a.Routes[1].Auth != AuthNone {
+		t.Fatalf("unexpected auth values: %+v", a.Routes)
+	}
+}
+
+func TestRoutesValidationErrors(t *testing.T) {
+	base := `
+listen: 127.0.0.1:18920
+issuer: https://auth.example.com
+redis:
+  addr: 127.0.0.1:6379
+audit:
+  file: /tmp/audit.log
+apps:
+  - id: q
+    hosts: [q.example.com]
+    secret_file: %s
+    routes:
+      - prefix: %s
+        upstream: %s
+        auth: %s
+`
+	cases := []struct {
+		name, prefix, upstream, auth string
+	}{
+		{"prefix without slash", "api/", "http://127.0.0.1:5300", "required"},
+		{"missing upstream", "/api/", "", "required"},
+		{"relative upstream", "/api/", "/nope", "required"},
+		{"bad auth", "/api/", "http://127.0.0.1:5300", "maybe"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			secret := write(t, dir, "q.secret", "x")
+			body := strings.Replace(base, "%s", secret, 1)
+			body = strings.Replace(body, "%s", tc.prefix, 1)
+			body = strings.Replace(body, "%s", tc.upstream, 1)
+			body = strings.Replace(body, "%s", tc.auth, 1)
+			if _, err := loadYAML(t, body); err == nil {
+				t.Fatalf("%s: expected validation error", tc.name)
+			}
+		})
+	}
+}
+
+func TestRoutesDuplicatePrefixRejected(t *testing.T) {
+	dir := t.TempDir()
+	secret := write(t, dir, "q.secret", "x")
+	body := `
+listen: 127.0.0.1:18920
+issuer: https://auth.example.com
+redis:
+  addr: 127.0.0.1:6379
+audit:
+  file: /tmp/audit.log
+apps:
+  - id: q
+    hosts: [q.example.com]
+    secret_file: ` + secret + `
+    routes:
+      - prefix: /api/
+        upstream: http://127.0.0.1:5300
+        auth: required
+      - prefix: /api/
+        upstream: http://127.0.0.1:5300
+        auth: none
+`
+	if _, err := loadYAML(t, body); err == nil {
+		t.Fatal("duplicate route prefix must be rejected")
+	}
+}
