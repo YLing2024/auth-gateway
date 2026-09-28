@@ -22,6 +22,9 @@ cp config.example.yaml config.yaml   # 按部署环境填写
 ## 关键行为
 
 - 路由：`/-/health`、`/_auth/{login,callback,logout,me}`；`/_auth/*` 先于会话检查。
+- 按路径分流（可选 `routes`）：一个 app 可声明多条 `prefix`，最长前缀优先（等长按书写顺序）；
+  `auth: required` 沿用整站鉴权行为，`auth: none` 为公开路径（不建会话、不注入身份头，但仍剥掉
+  客户端伪造的身份头和网关 cookie）；未命中任何 prefix 返回 404。无 `routes` 的 app 行为不变。
 - 会话 cookie：`__Host-<app>_session`，`HttpOnly; Secure; SameSite=Lax; Path=/`，无 Domain。
 - 未登录：导航请求 302 到 `/_auth/login?next=…`；API 请求（JSON/XHR/cors）401 JSON 并清 cookie。
 - 反代：只转发到配置白名单；先删除客户端身份头再注入 `X-Auth-User/App/Sid`；
@@ -32,7 +35,7 @@ cp config.example.yaml config.yaml   # 按部署环境填写
 ## 离线自测
 
 `test/selftest.sh` 在回环地址上用私有端口 18930/18931/18932 与 Redis DB 2
-（前缀 `gw:selftest:`）跑完 12 项验收，不需要真实 SSO：
+（前缀 `gw:selftest:`）跑完全部验收，不需要真实 SSO：
 
 ```sh
 bash test/selftest.sh
