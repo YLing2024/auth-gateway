@@ -11,6 +11,9 @@ token.key
 bin/
 dist/
 auth-gateway
+mocksso
+echoupstream
+wsprobe
 data/
 *.log
 *.test
