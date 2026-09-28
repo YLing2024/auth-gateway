@@ -18,6 +18,7 @@ HOST_B="b.example.com:18930"
 HOST_V2="v2.example.com:18930"
 HOST_R="r.example.com:18930"
 HOST_NR="nr.example.com:18930"
+HOST_BEAR="bear.example.com:18930"
 PREFIX="gw:selftest:"
 
 PASS=0
@@ -92,7 +93,7 @@ note "redis db2: $(redis-cli -n 2 ping)"
 RAND_HEX="$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
 printf '%s' "$RAND_HEX" > "$TMP/token.key"
 printf '%s' "$RAND_HEX" > "$TMP/sso.secret"
-for app in appa appb appv2 appr appnr; do printf '%s' "$RAND_HEX" > "$TMP/$app.secret"; done
+for app in appa appb appv2 appr appnr appbear; do printf '%s' "$RAND_HEX" > "$TMP/$app.secret"; done
 chmod 600 "$TMP"/*.key "$TMP"/*.secret
 
 cat > "$TMP/config.yaml" <<EOF
@@ -134,6 +135,8 @@ apps:
     hosts: [r.example.com]
     mode: protect
     secret_file: ${TMP}/appr.secret
+    accept_bearer: true
+    bearer_audiences: [appr, admin]
     routes:
       - prefix: /api/
         upstream: http://${UP_ADDR}
@@ -149,6 +152,13 @@ apps:
       - prefix: /api/
         upstream: http://${UP_ADDR}
         auth: required
+  - id: appbear
+    hosts: [bear.example.com]
+    upstream: http://${UP_ADDR}
+    mode: protect
+    secret_file: ${TMP}/appbear.secret
+    accept_bearer: true
+    bearer_audiences: [admin, home-admin]
 EOF
 
 printf '$ go build -o %s/bin ./cmd/...\n' "$TMP"
@@ -533,6 +543,115 @@ BADA_OUT="$("$TMP/bin/auth-gateway" -config "$TMP/badauth.yaml" 2>&1)"; BADA_RC=
 printf '%s\nexit=%d\n' "$BADA_OUT" "$BADA_RC"
 check_eq "16.5 auth 非法 → 非零退出" "true" "$([ "$BADA_RC" -ne 0 ] && echo true || echo false)"
 check_contains "16.6 报错指出 auth" "auth" "$BADA_OUT"
+
+# ── 17. client bearer (accept_bearer) ────────────────────────────────────
+
+title "17) 客户端 Bearer：默认关、合法放行、失败 401 不碰 cookie、cookie 优先"
+
+mint_token() { # query-string
+  curl -sS "http://$SSO_ADDR/test/mint?$1" | grep -o '"token":"[^"]*"' | head -1 | sed 's/.*:"//; s/"$//'
+}
+
+# 17.1 安全默认：未写 accept_bearer 的 app（appa）带合法 Bearer 仍然 401。
+TOK_APPA="$(mint_token 'sub=mock-user-1&aud=appa&exp_in=3600')"
+SD="$(curl -sS -o "$TMP/b_sd.body" -D "$TMP/b_sd.hdr" -w '%{http_code}' -H "Host: $HOST_A" \
+  -H "Authorization: Bearer $TOK_APPA" -H 'Accept: application/json' "http://$GW_ADDR/api/data")"
+printf '$ curl -sS -H %s -H %s http://%s/api/data\n' "'Host: a.example.com:18930'" \
+  "'Authorization: Bearer <valid, aud=appa>'" "$GW_ADDR"
+echo "safe-default appa: status=$SD body=$(cat "$TMP/b_sd.body")"
+check_eq "17.1 accept_bearer 默认关：合法 Bearer 仍 401" "401" "$SD"
+check_contains "17.2 401 body 为 unauthenticated" '"error":"unauthenticated"' "$(cat "$TMP/b_sd.body")"
+
+# 17.3 accept_bearer: true + 合法 Bearer（aud=admin）→ 200，上游收到 X-Auth-User=sub。
+SUBB="app-user-9"
+TOK_OK="$(mint_token "sub=$SUBB&aud=admin&exp_in=3600")"
+OK="$(curl -sS -o "$TMP/b_ok.body" -D "$TMP/b_ok.hdr" -w '%{http_code}' -H "Host: $HOST_BEAR" \
+  -H "Authorization: Bearer $TOK_OK" -H 'Accept: application/json' "http://$GW_ADDR/dash")"
+cat "$TMP/b_ok.body"; printf '\n'
+check_eq "17.3 合法 Bearer → 200" "200" "$OK"
+check_eq "17.4 上游收到 X-Auth-User=sub" "$SUBB" "$(json_str "$TMP/b_ok.body" x_auth_user)"
+check_eq "17.5 上游收到 X-Auth-App=appbear" "appbear" "$(json_str "$TMP/b_ok.body" x_auth_app)"
+check_eq "17.6 成功响应不含任何 Set-Cookie" "" "$(cookie_header "$TMP/b_ok.hdr")"
+
+# 17.7 过期 → 401，且不设/不清 cookie。
+TOK_EXP="$(mint_token 'sub=u&aud=admin&exp_in=-3600')"
+EXP="$(curl -sS -o "$TMP/b_exp.body" -D "$TMP/b_exp.hdr" -w '%{http_code}' -H "Host: $HOST_BEAR" \
+  -H "Authorization: Bearer $TOK_EXP" -H 'Accept: application/json' "http://$GW_ADDR/dash")"
+echo "expired: status=$EXP body=$(cat "$TMP/b_exp.body")"
+check_eq "17.7 过期 Bearer → 401" "401" "$EXP"
+check_eq "17.8 过期失败不碰 cookie" "" "$(cookie_header "$TMP/b_exp.hdr")"
+
+# 17.9 aud 不在白名单 → 401。
+TOK_AUD="$(mint_token 'sub=u&aud=other&exp_in=3600')"
+AUD="$(curl -sS -o /dev/null -D "$TMP/b_aud.hdr" -w '%{http_code}' -H "Host: $HOST_BEAR" \
+  -H "Authorization: Bearer $TOK_AUD" -H 'Accept: application/json' "http://$GW_ADDR/dash")"
+echo "bad aud: status=$AUD"
+check_eq "17.9 aud 不在白名单 → 401" "401" "$AUD"
+check_eq "17.10 aud 失败不碰 cookie" "" "$(cookie_header "$TMP/b_aud.hdr")"
+
+# 17.11 alg:none → 401（算法混淆防护）。
+TOK_NONE="$(mint_token 'sub=u&aud=admin&alg=none&exp_in=3600')"
+NONE="$(curl -sS -o /dev/null -D "$TMP/b_none.hdr" -w '%{http_code}' -H "Host: $HOST_BEAR" \
+  -H "Authorization: Bearer $TOK_NONE" -H 'Accept: application/json' "http://$GW_ADDR/dash")"
+echo "alg none: status=$NONE"
+check_eq "17.11 alg:none → 401" "401" "$NONE"
+check_eq "17.12 alg:none 失败不碰 cookie" "" "$(cookie_header "$TMP/b_none.hdr")"
+
+# 17.13 篡改签名 → 401。
+IFS='.' read -r TOK_H TOK_P TOK_S <<< "$TOK_OK"
+TOK_TAMPERED="$TOK_H.$TOK_P.$(printf '%s' "$TOK_S" | sed 's/^\(.\)\(.\)/\2\1/')"
+TAM="$(curl -sS -o /dev/null -D "$TMP/b_tam.hdr" -w '%{http_code}' -H "Host: $HOST_BEAR" \
+  -H "Authorization: Bearer $TOK_TAMPERED" -H 'Accept: application/json' "http://$GW_ADDR/dash")"
+echo "tampered: status=$TAM"
+check_eq "17.13 篡改签名 → 401" "401" "$TAM"
+check_eq "17.14 篡改失败不碰 cookie" "" "$(cookie_header "$TMP/b_tam.hdr")"
+
+# 17.15 jti 在撤销黑名单 → 401（复用 gw:revoked:<jti>）。
+TOK_REV="$(mint_token 'sub=u&aud=admin&jti=jti-revoke-1&exp_in=3600')"
+redis-cli -n 2 SET "${PREFIX}revoked:jti-revoke-1" 1 >/dev/null
+REV="$(curl -sS -o /dev/null -D "$TMP/b_rev.hdr" -w '%{http_code}' -H "Host: $HOST_BEAR" \
+  -H "Authorization: Bearer $TOK_REV" -H 'Accept: application/json' "http://$GW_ADDR/dash")"
+redis-cli -n 2 DEL "${PREFIX}revoked:jti-revoke-1" >/dev/null
+echo "revoked jti: status=$REV"
+check_eq "17.15 已撤销 jti → 401" "401" "$REV"
+check_eq "17.16 撤销失败不碰 cookie" "" "$(cookie_header "$TMP/b_rev.hdr")"
+
+# 17.17 cookie 有效且同时带 Bearer → 走 cookie（浏览器行为不变）。
+curl -sS -o /dev/null -D "$TMP/b1.hdr" -H "Host: $HOST_BEAR" "http://$GW_ADDR/_auth/login?next=%2Fdash"
+BB_AUTH="$(header_value "$TMP/b1.hdr" Location)"
+curl -sS -o /dev/null -D "$TMP/b2.hdr" "$BB_AUTH"
+BB_CB="$(header_value "$TMP/b2.hdr" Location)"
+curl -sS --resolve "bear.example.com:18930:127.0.0.1" -o /dev/null -D "$TMP/b3.hdr" "$BB_CB"
+SID_BEAR="$(cookie_header "$TMP/b3.hdr" | sed -n 's/.*__Host-appbear_session=\([^;]*\).*/\1/p')"
+echo "logged in appbear: sid=${SID_BEAR:0:8}..."
+TOK_OTHER="$(mint_token 'sub=app-bearer-user&aud=admin&exp_in=3600')"
+BOTH="$(curl -sS -o "$TMP/b_both.body" -w '%{http_code}' -H "Host: $HOST_BEAR" \
+  -H "Cookie: __Host-appbear_session=$SID_BEAR" -H "Authorization: Bearer $TOK_OTHER" \
+  -H 'Accept: application/json' "http://$GW_ADDR/dash")"
+cat "$TMP/b_both.body"; printf '\n'
+check_eq "17.17 cookie+Bearer → 200" "200" "$BOTH"
+check_eq "17.18 cookie 优先（上游看到 cookie 的 sub）" "mock-user-1" "$(json_str "$TMP/b_both.body" x_auth_user)"
+
+# 17.19 auth:none 路由即使带合法 Bearer 也不注入身份头（公开路径依旧公开）。
+TOK_R="$(mint_token 'sub=app-bearer-user&aud=appr&exp_in=3600')"
+NONE_RT="$(curl -sS -o "$TMP/b_none_rt.body" -w '%{http_code}' -H "Host: $HOST_R" \
+  -H "Authorization: Bearer $TOK_R" -H 'Accept: application/json' "http://$GW_ADDR/")"
+cat "$TMP/b_none_rt.body"; printf '\n'
+check_eq "17.19 none 路由带 Bearer 仍 200" "200" "$NONE_RT"
+check_eq "17.20 none 路由不注入 X-Auth-User" "" "$(json_str "$TMP/b_none_rt.body" x_auth_user)"
+
+# 17.21 /_auth/* 行为完全不变：带合法 Bearer 的 /_auth/me 仍 401。
+ME_B="$(curl -sS -o "$TMP/b_me.body" -D "$TMP/b_me.hdr" -w '%{http_code}' -H "Host: $HOST_BEAR" \
+  -H "Authorization: Bearer $TOK_OK" -H 'Accept: application/json' "http://$GW_ADDR/_auth/me")"
+echo "/_auth/me with bearer: status=$ME_B body=$(cat "$TMP/b_me.body")"
+check_eq "17.21 /_auth/me 不认 Bearer（行为不变）" "401" "$ME_B"
+
+# 17.22 proxy 模式 app（appv2，无 accept_bearer）带合法 Bearer → 401，两个开关互不相干。
+TOK_V2="$(mint_token 'sub=u&aud=appv2&exp_in=3600')"
+V2B="$(curl -sS -o /dev/null -w '%{http_code}' -H "Host: $HOST_V2" \
+  -H "Authorization: Bearer $TOK_V2" -H 'Accept: application/json' "http://$GW_ADDR/api/data")"
+echo "proxy-mode app with bearer: status=$V2B"
+check_eq "17.22 mode:proxy 未开 accept_bearer：Bearer 仍 401" "401" "$V2B"
 
 # ── summary ──────────────────────────────────────────────────────────────
 
