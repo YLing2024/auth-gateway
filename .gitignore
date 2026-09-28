@@ -10,10 +10,10 @@ token.key
 # 构建与运行时
 bin/
 dist/
-auth-gateway
-mocksso
-echoupstream
-wsprobe
+/auth-gateway
+/mocksso
+/echoupstream
+/wsprobe
 data/
 *.log
 *.test
