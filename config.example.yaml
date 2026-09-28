@@ -67,3 +67,17 @@ apps:
     api_upstream: http://127.0.0.1:3100
     mode: proxy
     secret_file: /etc/auth-gateway/admin.secret
+
+  # routes：只把指定路径前缀反代过网关，其余路径由 nginx 直接服务。
+  # prefix 最长匹配优先；auth: none 为公开路径（不建会话、不注入身份头）。
+  - id: microui
+    hosts: [microui.example.com]
+    mode: protect
+    secret_file: /etc/auth-gateway/microui.secret
+    routes:
+      - prefix: /api/
+        upstream: http://127.0.0.1:5300
+        auth: required        # 需要登录：未登录导航 302 / API 401，注入身份头
+      - prefix: /
+        upstream: http://127.0.0.1:5300
+        auth: none            # 公开：直接反代，仍剥掉伪造身份头
