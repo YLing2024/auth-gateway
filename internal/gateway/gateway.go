@@ -37,8 +37,30 @@ type Gateway struct {
 
 type appRoute struct {
 	cfg        config.AppConfig
-	proxy      *proxy.Handler
+	proxy      *proxy.Handler // legacy whole-site handler (nil when routes exist)
 	cookieName string
+	routes     []*pathRoute // non-empty only for path-routed apps
+}
+
+// pathRoute is one compiled route entry. Matching is longest-prefix-first; the
+// slice is kept in config order so equal-length prefixes resolve to the first.
+type pathRoute struct {
+	prefix string
+	auth   string
+	proxy  *proxy.Handler
+}
+
+// matchRoute returns the route with the longest matching prefix, or nil.
+func matchRoute(routes []*pathRoute, path string) *pathRoute {
+	var best *pathRoute
+	bestLen := -1
+	for _, rt := range routes {
+		if len(rt.prefix) > bestLen && strings.HasPrefix(path, rt.prefix) {
+			best = rt
+			bestLen = len(rt.prefix)
+		}
+	}
+	return best
 }
 
 // New assembles the gateway from validated configuration and shared services.
@@ -57,11 +79,23 @@ func New(cfg *config.Config, store *session.Store, provider *oauth.Provider, al 
 		logf:     logger,
 	}
 	for _, ac := range cfg.Apps {
-		p, err := proxy.New(ac, cfg.Session.CookieSuffix)
-		if err != nil {
-			return nil, err
+		ar := &appRoute{cfg: ac, cookieName: session.CookieName(ac.ID, cfg.Session.CookieSuffix)}
+		if len(ac.Routes) == 0 {
+			p, err := proxy.New(ac, cfg.Session.CookieSuffix)
+			if err != nil {
+				return nil, err
+			}
+			ar.proxy = p
+		} else {
+			for _, rt := range ac.Routes {
+				injectBearer := rt.Auth == config.AuthRequired && ac.Mode == config.ModeProxy
+				p, err := proxy.NewForRoute(ac.ID, rt.Upstream, cfg.Session.CookieSuffix, injectBearer)
+				if err != nil {
+					return nil, err
+				}
+				ar.routes = append(ar.routes, &pathRoute{prefix: rt.Prefix, auth: rt.Auth, proxy: p})
+			}
 		}
-		ar := &appRoute{cfg: ac, proxy: p, cookieName: session.CookieName(ac.ID, cfg.Session.CookieSuffix)}
 		g.apps = append(g.apps, ar)
 		for _, h := range ac.Hosts {
 			g.byHost[strings.ToLower(strings.TrimSpace(h))] = ar
@@ -247,6 +281,30 @@ func (g *Gateway) handleProxy(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
 	}
+	if len(app.routes) == 0 {
+		// Legacy whole-site app: unchanged behaviour.
+		g.serveProtected(w, r, app, app.proxy)
+		return
+	}
+	rt := matchRoute(app.routes, r.URL.Path)
+	if rt == nil {
+		// No route claims this path: never fall through to a default target.
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	if rt.auth == config.AuthNone {
+		// Public route: no session is created or read and no identity header is
+		// injected. The handler still strips client-forged identity headers and
+		// the gateway's own cookie before forwarding.
+		rt.proxy.ServeHTTP(w, r)
+		return
+	}
+	g.serveProtected(w, r, app, rt.proxy)
+}
+
+// serveProtected runs the existing required-session flow (302/401 split, session
+// validation, silent refresh, identity injection) against one proxy handler.
+func (g *Gateway) serveProtected(w http.ResponseWriter, r *http.Request, app *appRoute, p *proxy.Handler) {
 	sess, ok := g.validSession(r, app)
 	if !ok {
 		if proxy.IsAPIRequest(r) {
@@ -262,7 +320,7 @@ func (g *Gateway) handleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 	id := proxy.Identity{Sub: sess.Sub, App: app.cfg.ID, SID: sess.SID, AccessToken: sess.AccessToken}
 	id = g.maybeRefresh(r, app, sess, id)
-	app.proxy.ServeHTTP(w, proxy.WithIdentity(r, id))
+	p.ServeHTTP(w, proxy.WithIdentity(r, id))
 }
 
 // validSession reads and validates the per-app cookie. A session minted for a
