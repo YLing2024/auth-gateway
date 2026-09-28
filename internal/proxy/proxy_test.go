@@ -117,6 +117,47 @@ func TestIsAPIRequest(t *testing.T) {
 	}
 }
 
+func TestRouteNoneStripsForgedIdentity(t *testing.T) {
+	// auth:none routes carry no identity, but must still remove client-forged
+	// identity headers (security red line) and the gateway's own cookie.
+	var got struct {
+		User   string
+		Email  string
+		Cookie string
+		Auth   string
+	}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got.User = r.Header.Get("X-Auth-User")
+		got.Email = r.Header.Get("X-Auth-Email")
+		got.Cookie = r.Header.Get("Cookie")
+		got.Auth = r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	h, err := NewForRoute("quotahub", upstream.URL, "_session", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "http://quotahub.example.com/", nil)
+	req.Header.Set("X-Auth-User", "root")
+	req.Header.Set("X-Auth-Email", "root@example.com")
+	req.Header.Set("Cookie", "__Host-quotahub_session=deadbeef; theme=dark")
+	// Deliberately no WithIdentity: a public route must not inject anything.
+
+	h.ServeHTTP(httptest.NewRecorder(), req)
+
+	if got.User != "" || got.Email != "" {
+		t.Fatalf("forged headers leaked on auth:none route: user=%q email=%q", got.User, got.Email)
+	}
+	if got.Cookie != "theme=dark" {
+		t.Fatalf("gateway cookie leaked on auth:none route: cookie=%q", got.Cookie)
+	}
+	if got.Auth != "" {
+		t.Fatalf("auth:none must not inject Authorization, got %q", got.Auth)
+	}
+}
+
 func TestProxyTargetIsWhitelisted(t *testing.T) {
 	// A request Host header must never change the target; the handler is bound
 	// to the configured upstream only.

@@ -73,6 +73,18 @@ func New(app config.AppConfig, cookieSuffix string) (*Handler, error) {
 	return h, nil
 }
 
+// NewForRoute builds a handler bound to one route upstream. Unlike New it never
+// derives an api_upstream; the caller has already decided the auth mode.
+func NewForRoute(appID, upstream, cookieSuffix string, injectBearer bool) (*Handler, error) {
+	u, err := url.Parse(upstream)
+	if err != nil {
+		return nil, err
+	}
+	h := &Handler{app: config.AppConfig{ID: appID}, suffix: cookieSuffix}
+	h.upstream = h.newProxy(u, injectBearer)
+	return h, nil
+}
+
 // CookieName is the gateway cookie name for this app.
 func (h *Handler) CookieName() string { return "__Host-" + h.app.ID + h.suffix }
 
