@@ -16,6 +16,8 @@ UP_ADDR="127.0.0.1:18932"
 HOST_A="a.example.com:18930"
 HOST_B="b.example.com:18930"
 HOST_V2="v2.example.com:18930"
+HOST_R="r.example.com:18930"
+HOST_NR="nr.example.com:18930"
 PREFIX="gw:selftest:"
 
 PASS=0
@@ -90,7 +92,7 @@ note "redis db2: $(redis-cli -n 2 ping)"
 RAND_HEX="$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
 printf '%s' "$RAND_HEX" > "$TMP/token.key"
 printf '%s' "$RAND_HEX" > "$TMP/sso.secret"
-for app in appa appb appv2; do printf '%s' "$RAND_HEX" > "$TMP/$app.secret"; done
+for app in appa appb appv2 appr appnr; do printf '%s' "$RAND_HEX" > "$TMP/$app.secret"; done
 chmod 600 "$TMP"/*.key "$TMP"/*.secret
 
 cat > "$TMP/config.yaml" <<EOF
@@ -128,6 +130,25 @@ apps:
     api_upstream: http://${UP_ADDR}
     mode: proxy
     secret_file: ${TMP}/appv2.secret
+  - id: appr
+    hosts: [r.example.com]
+    mode: protect
+    secret_file: ${TMP}/appr.secret
+    routes:
+      - prefix: /api/
+        upstream: http://${UP_ADDR}
+        auth: required
+      - prefix: /
+        upstream: http://${UP_ADDR}
+        auth: none
+  - id: appnr
+    hosts: [nr.example.com]
+    mode: protect
+    secret_file: ${TMP}/appnr.secret
+    routes:
+      - prefix: /api/
+        upstream: http://${UP_ADDR}
+        auth: required
 EOF
 
 printf '$ go build -o %s/bin ./cmd/...\n' "$TMP"
@@ -404,6 +425,114 @@ else
   check_eq "14.1 缺密钥时非零退出" "true" "false"
 fi
 check_contains "14.2 报错指向 token 密钥" "token encryption key" "$BAD_OUT"
+
+# ── 15. path-routed auth (routes) ───────────────────────────────────────
+
+title "15) 按路径分流：最长前缀、required/none 差异、伪造头剥离、WS、先登录后可用"
+
+printf '$ curl -sS -o /dev/null -D - -H %s http://%s/api/xyz\n' "'Host: r.example.com:18930'" "$GW_ADDR"
+curl -sS -o /dev/null -D "$TMP/r1.hdr" -H "Host: $HOST_R" "http://$GW_ADDR/api/xyz"
+cat "$TMP/r1.hdr"
+check_eq "15.1 最长前缀命中 required：未登录导航 302" "302" "$(status_of "$TMP/r1.hdr")"
+check_eq "15.2 302 指向登录并带 next" "/_auth/login?next=%2Fapi%2Fxyz" "$(header_value "$TMP/r1.hdr" Location)"
+
+R_API="$(curl -sS -o "$TMP/r2.body" -w '%{http_code}' -H "Host: $HOST_R" -H 'Accept: application/json' "http://$GW_ADDR/api/xyz")"
+echo "required API: status=$R_API body=$(cat "$TMP/r2.body")"
+check_eq "15.3 required 路径 API 语义 401" "401" "$R_API"
+check_contains "15.4 401 JSON body" '"error":"unauthenticated"' "$(cat "$TMP/r2.body")"
+
+R_PUB="$(curl -sS -o "$TMP/r3.body" -D "$TMP/r3.hdr" -w '%{http_code}' -H "Host: $HOST_R" "http://$GW_ADDR/")"
+cat "$TMP/r3.body"; printf '\n'
+check_eq "15.5 none 路径未登录正常 200 反代" "200" "$R_PUB"
+check_eq "15.6 none 路径不注入 X-Auth-User" "" "$(json_str "$TMP/r3.body" x_auth_user)"
+check_not_contains "15.7 none 路径不下发网关 cookie" "__Host-appr_session" "$(cat "$TMP/r3.hdr")"
+
+curl -sS -o "$TMP/r4.body" -H "Host: $HOST_R" -H 'X-Auth-User: root' -H 'X-Auth-Email: root@example.com' "http://$GW_ADDR/"
+cat "$TMP/r4.body"; printf '\n'
+check_eq "15.8 none 路径伪造 X-Auth-User 被剥掉" "" "$(json_str "$TMP/r4.body" x_auth_user)"
+check_not_contains "15.9 伪造 X-Auth-Email 未到达上游" "root@example.com" "$(cat "$TMP/r4.body")"
+
+R_ME="$(curl -sS -o "$TMP/r5.body" -w '%{http_code}' -H "Host: $HOST_R" -H 'Accept: application/json' "http://$GW_ADDR/_auth/me")"
+check_eq "15.10 /_auth/me 在 routes app 上仍由网关处理（未登录 401）" "401" "$R_ME"
+check_contains "15.11 /_auth/me 返回网关 JSON" '"error":"unauthenticated"' "$(cat "$TMP/r5.body")"
+
+# none 页面主动登录 → 同站 required 路由立即可用
+curl -sS -o /dev/null -D "$TMP/r6.hdr" -H "Host: $HOST_R" "http://$GW_ADDR/_auth/login?next=%2Fapi%2Fdata"
+R_AUTH="$(header_value "$TMP/r6.hdr" Location)"
+check_eq "15.12 none 页面可主动登录：302" "302" "$(status_of "$TMP/r6.hdr")"
+check_contains "15.13 登录跳 SSO authorize" "/authorize?" "$R_AUTH"
+curl -sS -o /dev/null -D "$TMP/r7.hdr" "$R_AUTH"
+R_CB="$(header_value "$TMP/r7.hdr" Location)"
+curl -sS --resolve "r.example.com:18930:127.0.0.1" -o /dev/null -D "$TMP/r8.hdr" "$R_CB"
+SID_R="$(cookie_header "$TMP/r8.hdr" | sed -n 's/.*__Host-appr_session=\([^;]*\).*/\1/p')"
+echo "logged in appr: sid=${SID_R:0:8}... status=$(status_of "$TMP/r8.hdr")"
+check_contains "15.14 登录成功下发网关 cookie" "__Host-appr_session=" "$(cookie_header "$TMP/r8.hdr")"
+R_AFTER="$(curl -sS -o "$TMP/r9.body" -w '%{http_code}' -H "Host: $HOST_R" -H "Cookie: __Host-appr_session=$SID_R" -H 'Accept: application/json' "http://$GW_ADDR/api/data")"
+cat "$TMP/r9.body"; printf '\n'
+check_eq "15.15 登录后 required 路由 200" "200" "$R_AFTER"
+check_eq "15.16 required 路由注入登录身份" "mock-user-1" "$(json_str "$TMP/r9.body" x_auth_user)"
+
+printf '$ wsprobe -addr %s -host %s -path /v2ws -msg pub-ws\n' "$GW_ADDR" "$HOST_R"
+WS_PUB="$("$TMP/bin/wsprobe" -addr "$GW_ADDR" -host "$HOST_R" -path /v2ws -msg pub-ws 2>&1)"
+echo "$WS_PUB"
+check_contains "15.17 none 路由 WS 握手 101" "HANDSHAKE 101" "$WS_PUB"
+check_contains "15.18 none 路由 WS 回显" "ECHO pub-ws" "$WS_PUB"
+
+R_NR="$(curl -sS -o /dev/null -w '%{http_code}' -H "Host: $HOST_NR" "http://$GW_ADDR/other")"
+echo "unmatched path on appnr: $R_NR"
+check_eq "15.19 未命中任何 prefix → 404（不降级为公开反代）" "404" "$R_NR"
+
+AUDIT_BEFORE="$(wc -l < "$TMP/audit.log" | tr -d ' ')"
+curl -sS -o /dev/null -H "Host: $HOST_R" "http://$GW_ADDR/"
+AUDIT_AFTER="$(wc -l < "$TMP/audit.log" | tr -d ' ')"
+echo "audit lines before=$AUDIT_BEFORE after=$AUDIT_AFTER"
+check_eq "15.20 none 路由默认不写审计" "$AUDIT_BEFORE" "$AUDIT_AFTER"
+
+# ── 16. routes config validation aborts startup ──────────────────────────
+
+title "16) 启动校验：routes 配置不合法必须报错退出（不静默降级）"
+
+mk_bad_config() { # file, routes-body
+  cat > "$1" <<EOF
+listen: 127.0.0.1:18940
+issuer: http://${SSO_ADDR}
+redis:
+  addr: 127.0.0.1:6379
+  db: 2
+  prefix: "${PREFIX}bad:"
+audit:
+  file: ${TMP}/audit-bad.log
+apps:
+  - id: br
+    hosts: [br.example.com]
+    secret_file: ${TMP}/appa.secret
+    routes:
+$2
+EOF
+}
+
+mk_bad_config "$TMP/badprefix.yaml" "      - prefix: bad
+        upstream: http://${UP_ADDR}
+        auth: required"
+BADP_OUT="$("$TMP/bin/auth-gateway" -config "$TMP/badprefix.yaml" 2>&1)"; BADP_RC=$?
+printf '%s\nexit=%d\n' "$BADP_OUT" "$BADP_RC"
+check_eq "16.1 prefix 不以 / 开头 → 非零退出" "true" "$([ "$BADP_RC" -ne 0 ] && echo true || echo false)"
+check_contains "16.2 报错指出 prefix" "prefix" "$BADP_OUT"
+
+mk_bad_config "$TMP/badup.yaml" "      - prefix: /api/
+        auth: required"
+BADU_OUT="$("$TMP/bin/auth-gateway" -config "$TMP/badup.yaml" 2>&1)"; BADU_RC=$?
+printf '%s\nexit=%d\n' "$BADU_OUT" "$BADU_RC"
+check_eq "16.3 routes upstream 缺失 → 非零退出" "true" "$([ "$BADU_RC" -ne 0 ] && echo true || echo false)"
+check_contains "16.4 报错指出 routes upstream" "routes[0].upstream" "$BADU_OUT"
+
+mk_bad_config "$TMP/badauth.yaml" "      - prefix: /api/
+        upstream: http://${UP_ADDR}
+        auth: bogus"
+BADA_OUT="$("$TMP/bin/auth-gateway" -config "$TMP/badauth.yaml" 2>&1)"; BADA_RC=$?
+printf '%s\nexit=%d\n' "$BADA_OUT" "$BADA_RC"
+check_eq "16.5 auth 非法 → 非零退出" "true" "$([ "$BADA_RC" -ne 0 ] && echo true || echo false)"
+check_contains "16.6 报错指出 auth" "auth" "$BADA_OUT"
 
 # ── summary ──────────────────────────────────────────────────────────────
 
