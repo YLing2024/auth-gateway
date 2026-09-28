@@ -1,0 +1,22 @@
+# 配置与密钥：一律不入库
+config.yaml
+config.local.yaml
+*.secret
+token.key
+.env
+.env.*
+!.env.example
+
+# 构建与运行时
+bin/
+dist/
+auth-gateway
+data/
+*.log
+*.test
+
+# 编辑器
+.idea/
+.vscode/
+*.swp
+.DS_Store
