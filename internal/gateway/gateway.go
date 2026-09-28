@@ -7,7 +7,9 @@
 package gateway
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
@@ -304,9 +306,28 @@ func (g *Gateway) handleProxy(w http.ResponseWriter, r *http.Request) {
 
 // serveProtected runs the existing required-session flow (302/401 split, session
 // validation, silent refresh, identity injection) against one proxy handler.
+//
+// A protected app with accept_bearer: true additionally accepts a client
+// Authorization: Bearer token when no valid session cookie is present. Cookie
+// wins over Bearer, so browser behaviour is unchanged.
 func (g *Gateway) serveProtected(w http.ResponseWriter, r *http.Request, app *appRoute, p *proxy.Handler) {
 	sess, ok := g.validSession(r, app)
 	if !ok {
+		if app.cfg.AcceptBearer {
+			if tok, present := bearerToken(r); present {
+				id, err := g.bearerIdentity(r.Context(), app, tok)
+				if err != nil {
+					// Failed Bearer: always a JSON 401, never a redirect, and
+					// never a cookie (we must not clear or set anything).
+					g.audit.Log(app.cfg.ID, "", "denied", "bearer")
+					writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "unauthenticated"})
+					return
+				}
+				g.audit.Log(app.cfg.ID, id.Sub, "bearer", "ok")
+				p.ServeHTTP(w, proxy.WithIdentity(r, id))
+				return
+			}
+		}
 		if proxy.IsAPIRequest(r) {
 			session.ClearSessionCookie(w, app.cookieName)
 			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "unauthenticated"})
@@ -321,6 +342,44 @@ func (g *Gateway) serveProtected(w http.ResponseWriter, r *http.Request, app *ap
 	id := proxy.Identity{Sub: sess.Sub, App: app.cfg.ID, SID: sess.SID, AccessToken: sess.AccessToken}
 	id = g.maybeRefresh(r, app, sess, id)
 	p.ServeHTTP(w, proxy.WithIdentity(r, id))
+}
+
+// bearerIdentity validates a client-presented access token locally and maps it
+// to an upstream identity. It sets only Sub: no session id, no upstream access
+// token, and no cookie. A token whose jti is blacklisted is rejected.
+func (g *Gateway) bearerIdentity(ctx context.Context, app *appRoute, token string) (proxy.Identity, error) {
+	claims, err := g.provider.VerifyAccessToken(ctx, token, app.cfg.BearerAudiences)
+	if err != nil {
+		return proxy.Identity{}, err
+	}
+	if claims.JTI != "" {
+		revoked, err := g.store.IsRevoked(claims.JTI)
+		if err != nil {
+			return proxy.Identity{}, err
+		}
+		if revoked {
+			return proxy.Identity{}, fmt.Errorf("oauth: token jti is revoked")
+		}
+	}
+	return proxy.Identity{Sub: claims.Subject, App: app.cfg.ID}, nil
+}
+
+// bearerToken extracts a client Bearer token. present is true whenever the
+// Authorization header uses the Bearer scheme, even with an empty token: a
+// malformed attempt still deserves a 401 rather than a login redirect.
+func bearerToken(r *http.Request) (string, bool) {
+	h := strings.TrimSpace(r.Header.Get("Authorization"))
+	if h == "" {
+		return "", false
+	}
+	scheme, tok := h, ""
+	if i := strings.IndexAny(h, " \t"); i >= 0 {
+		scheme, tok = h[:i], strings.TrimSpace(h[i+1:])
+	}
+	if !strings.EqualFold(scheme, "Bearer") {
+		return "", false
+	}
+	return tok, true
 }
 
 // validSession reads and validates the per-app cookie. A session minted for a
