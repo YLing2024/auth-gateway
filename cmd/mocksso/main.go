@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -72,6 +73,7 @@ func main() {
 	mux.HandleFunc("/authorize", s.handleAuthorize)
 	mux.HandleFunc("/token", s.handleToken)
 	mux.HandleFunc("/revoke", s.handleRevoke)
+	mux.HandleFunc("/test/mint", s.handleMint) // self-test only: mint arbitrary JWTs
 	mux.HandleFunc("/-/health", func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, "ok") })
 
 	s.logger.Printf("listening on %s (issuer %s)", *addr, s.issuer)
@@ -179,11 +181,67 @@ func (s *server) handleRevoke(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) signIDToken(claims map[string]any) (string, error) {
-	header := map[string]any{"alg": "ES256", "typ": "JWT", "kid": s.kid}
+	return s.signJWT(claims, "ES256")
+}
+
+// handleMint is a self-test helper: it mints a JWT with caller-chosen claims and
+// algorithm so the gateway's bearer validation (expiry, aud, alg:none, jti
+// revocation) can be exercised offline. It must never be deployed.
+func (s *server) handleMint(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	sub := q.Get("sub")
+	if sub == "" {
+		sub = "mock-user-1"
+	}
+	aud := q.Get("aud")
+	if aud == "" {
+		aud = "test"
+	}
+	alg := q.Get("alg")
+	if alg == "" {
+		alg = "ES256"
+	}
+	jti := q.Get("jti")
+	if jti == "" {
+		jti = mustRandom(8)
+	}
+	expIn := 3600
+	if v := q.Get("exp_in"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			expIn = n
+		}
+	}
+	now := time.Now()
+	claims := map[string]any{
+		"iss": s.issuer, "sub": sub, "aud": aud,
+		"iat": now.Unix(), "exp": now.Add(time.Duration(expIn) * time.Second).Unix(), "jti": jti,
+	}
+	if v := q.Get("nbf_in"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			claims["nbf"] = now.Add(time.Duration(n) * time.Second).Unix()
+		}
+	}
+	tok, err := s.signJWT(claims, alg)
+	if err != nil {
+		http.Error(w, "internal", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"token": tok, "jti": jti, "sub": sub, "aud": aud, "alg": alg})
+}
+
+func (s *server) signJWT(claims map[string]any, alg string) (string, error) {
+	header := map[string]any{"alg": alg, "typ": "JWT"}
+	if alg != "none" {
+		header["kid"] = s.kid
+	}
 	hb, _ := json.Marshal(header)
 	cb, _ := json.Marshal(claims)
 	enc := base64.RawURLEncoding
 	signingInput := enc.EncodeToString(hb) + "." + enc.EncodeToString(cb)
+	if alg == "none" {
+		return signingInput + ".", nil
+	}
 	sum := sha256.Sum256([]byte(signingInput))
 	rr, ss, err := ecdsa.Sign(rand.Reader, s.key, sum[:])
 	if err != nil {
