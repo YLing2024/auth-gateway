@@ -36,6 +36,14 @@ const ModeProtect = "protect"
 // ModeProxy additionally stores tokens and injects a bearer token upstream.
 const ModeProxy = "proxy"
 
+// AuthRequired means the route behaves like a fully protected app: session
+// required, 302/401 split, identity headers injected.
+const AuthRequired = "required"
+
+// AuthNone means the route is public: no session is created or read and no
+// identity headers are injected (forged ones are still stripped).
+const AuthNone = "none"
+
 // Config is the fully resolved gateway configuration.
 type Config struct {
 	Listen         string        `yaml:"listen"`
@@ -80,6 +88,10 @@ type AuditConfig struct {
 }
 
 // AppConfig is one protected site.
+//
+// Without Routes the whole app is one protected upstream (legacy behaviour,
+// byte-for-byte unchanged). With Routes only the listed path prefixes are
+// proxied, each with its own upstream and auth mode.
 type AppConfig struct {
 	ID          string   `yaml:"id"`
 	Hosts       []string `yaml:"hosts"`
@@ -87,9 +99,18 @@ type AppConfig struct {
 	APIUpstream string   `yaml:"api_upstream"`
 	Mode        string   `yaml:"mode"`
 	SecretFile  string   `yaml:"secret_file"`
+	Routes      []Route  `yaml:"routes"`
 
 	// ClientSecret is loaded from SecretFile, never serialized.
 	ClientSecret string `yaml:"-"`
+}
+
+// Route is one path-prefix dispatch entry inside an app. The longest matching
+// prefix wins; equal-length prefixes fall back to config order.
+type Route struct {
+	Prefix   string `yaml:"prefix"`
+	Upstream string `yaml:"upstream"`
+	Auth     string `yaml:"auth"` // required | none
 }
 
 // Load reads YAML from path, applies environment overrides and validates.
@@ -218,21 +239,60 @@ func (c *Config) normalizeAndValidate() error {
 				seenHost[h] = a.ID
 			}
 		}
-		if err := validateUpstream(a.ID, "upstream", a.Upstream); err != nil {
-			errs = append(errs, err.Error())
-		}
-		switch a.Mode {
-		case ModeProtect:
-		case ModeProxy:
-			needTokenKey = true
-			if strings.TrimSpace(a.APIUpstream) == "" {
-				a.APIUpstream = a.Upstream // default to the same origin
-			}
-			if err := validateUpstream(a.ID, "api_upstream", a.APIUpstream); err != nil {
+		if len(a.Routes) == 0 {
+			// Legacy whole-site app: exactly the pre-routes validation.
+			if err := validateUpstream(a.ID, "upstream", a.Upstream); err != nil {
 				errs = append(errs, err.Error())
 			}
-		default:
-			errs = append(errs, fmt.Sprintf("app %q has invalid mode %q (want protect|proxy)", a.ID, a.Mode))
+			switch a.Mode {
+			case ModeProtect:
+			case ModeProxy:
+				needTokenKey = true
+				if strings.TrimSpace(a.APIUpstream) == "" {
+					a.APIUpstream = a.Upstream // default to the same origin
+				}
+				if err := validateUpstream(a.ID, "api_upstream", a.APIUpstream); err != nil {
+					errs = append(errs, err.Error())
+				}
+			default:
+				errs = append(errs, fmt.Sprintf("app %q has invalid mode %q (want protect|proxy)", a.ID, a.Mode))
+			}
+		} else {
+			// Path-routed app. mode is optional and defaults to protect; an
+			// app-level upstream is optional here (routes carry their own).
+			seenPrefix := map[string]bool{}
+			for j := range a.Routes {
+				rt := &a.Routes[j]
+				if !strings.HasPrefix(rt.Prefix, "/") {
+					errs = append(errs, fmt.Sprintf("app %q routes[%d].prefix %q must start with /", a.ID, j, rt.Prefix))
+				} else if seenPrefix[rt.Prefix] {
+					errs = append(errs, fmt.Sprintf("app %q has duplicate route prefix %q", a.ID, rt.Prefix))
+				} else {
+					seenPrefix[rt.Prefix] = true
+				}
+				if err := validateUpstream(a.ID, fmt.Sprintf("routes[%d].upstream", j), rt.Upstream); err != nil {
+					errs = append(errs, err.Error())
+				}
+				switch rt.Auth {
+				case AuthRequired, AuthNone:
+				default:
+					errs = append(errs, fmt.Sprintf("app %q routes[%d].auth %q is invalid (want required|none)", a.ID, j, rt.Auth))
+				}
+			}
+			if strings.TrimSpace(a.Upstream) != "" {
+				if err := validateUpstream(a.ID, "upstream", a.Upstream); err != nil {
+					errs = append(errs, err.Error())
+				}
+			}
+			switch a.Mode {
+			case "":
+				a.Mode = ModeProtect
+			case ModeProtect:
+			case ModeProxy:
+				needTokenKey = true
+			default:
+				errs = append(errs, fmt.Sprintf("app %q has invalid mode %q (want protect|proxy)", a.ID, a.Mode))
+			}
 		}
 		if strings.TrimSpace(a.SecretFile) == "" {
 			errs = append(errs, fmt.Sprintf("app %q is missing secret_file", a.ID))
