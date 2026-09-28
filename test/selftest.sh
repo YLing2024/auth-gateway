@@ -15,6 +15,7 @@ SSO_ADDR="127.0.0.1:18931"
 UP_ADDR="127.0.0.1:18932"
 HOST_A="a.example.com:18930"
 HOST_B="b.example.com:18930"
+HOST_V2="v2.example.com:18930"
 PREFIX="gw:selftest:"
 
 PASS=0
@@ -363,6 +364,46 @@ if [ -n "$LAN_IP" ] && [ "${LAN_IP#127.}" = "$LAN_IP" ]; then
 else
   note "无额外非回环地址，跳过 12.3"
 fi
+
+# ── 13. proxy mode: bearer injection + encrypted token at rest (extra) ───
+
+title "13) 追加：proxy 模式注入 Bearer + token 加密存放"
+curl -sS -o /dev/null -D "$TMP/v1.hdr" -H "Host: $HOST_V2" "http://$GW_ADDR/_auth/login?next=%2Fv2-home"
+V_AUTH="$(header_value "$TMP/v1.hdr" Location)"
+curl -sS -o /dev/null -D "$TMP/v2.hdr" "$V_AUTH"
+V_CB="$(header_value "$TMP/v2.hdr" Location)"
+curl -sS --resolve "v2.example.com:18930:127.0.0.1" -o /dev/null -D "$TMP/v3.hdr" "$V_CB"
+SID_V2="$(cookie_header "$TMP/v3.hdr" | sed -n 's/.*__Host-appv2_session=\([^;]*\).*/\1/p')"
+echo "logged in v2: sid=${SID_V2:0:8}... status=$(status_of "$TMP/v3.hdr")"
+
+printf '$ curl -sS -H %s -H %s -H %s http://%s/api/data\n' \
+  "'Host: v2.example.com:18930'" "'Cookie: __Host-appv2_session=<sid>'" \
+  "'Accept: application/json'" "$GW_ADDR"
+curl -sS -o "$TMP/c13.body" -H "Host: $HOST_V2" -H "Cookie: __Host-appv2_session=$SID_V2" \
+  -H 'Accept: application/json' "http://$GW_ADDR/api/data"
+cat "$TMP/c13.body"; printf '\n'
+check_contains "13.1 上游收到 Bearer access_token" '"authorization":"Bearer at-' "$(cat "$TMP/c13.body")"
+
+RAW_SESS="$(redis-cli -n 2 GET "${PREFIX}sess:${SID_V2}")"
+printf '$ redis-cli -n 2 GET %ssess:<sid>\n%s\n' "$PREFIX" "$RAW_SESS"
+check_not_contains "13.2 Redis 中无明文 access_token" "at-" "$RAW_SESS"
+check_contains "13.3 Redis 中为密文 access_token 字段" '"access_token":"' "$RAW_SESS"
+
+# ── 14. missing token key aborts startup (extra) ─────────────────────────
+
+title "14) 追加：token 密钥文件缺失 → 启动报错（不退化为明文）"
+sed "s#${TMP}/token.key#${TMP}/does-not-exist.key#" "$TMP/config.yaml" > "$TMP/bad.yaml"
+printf '$ %s/auth-gateway -config %s/bad.yaml\n' "$TMP" "$TMP"
+BAD_OUT="$("$TMP/bin/auth-gateway" -config "$TMP/bad.yaml" 2>&1)"
+BAD_RC=$?
+printf '%s\n' "$BAD_OUT"
+printf 'exit=%d\n' "$BAD_RC"
+if [ "$BAD_RC" -ne 0 ]; then
+  check_eq "14.1 缺密钥时非零退出" "true" "true"
+else
+  check_eq "14.1 缺密钥时非零退出" "true" "false"
+fi
+check_contains "14.2 报错指向 token 密钥" "token encryption key" "$BAD_OUT"
 
 # ── summary ──────────────────────────────────────────────────────────────
 
