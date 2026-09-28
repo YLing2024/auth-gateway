@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -112,6 +113,62 @@ func TestVerifyIDTokenRejectsTamperedSignature(t *testing.T) {
 		t.Fatal("token signed by an unknown key was accepted")
 	}
 }
+
+func TestVerifyAccessToken(t *testing.T) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const kid = "acc-key-1"
+	doc := jwksFor(key, kid)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(doc)
+	}))
+	defer srv.Close()
+	p := NewProvider(srv.URL, nil, time.Hour, 2*time.Minute)
+
+	good := signES256(t, key, kid, map[string]any{
+		"iss": srv.URL, "sub": "app-user-9", "aud": []string{"home-admin", "admin"},
+		"exp": time.Now().Add(time.Hour).Unix(), "jti": "jti-1",
+	})
+	claims, err := p.VerifyAccessToken(t.Context(), good, []string{"admin"})
+	if err != nil {
+		t.Fatalf("valid access token rejected: %v", err)
+	}
+	if claims.Subject != "app-user-9" || claims.JTI != "jti-1" {
+		t.Fatalf("unexpected claims: %+v", claims)
+	}
+	// Array audience must also match a single accepted value.
+	if _, err := p.VerifyAccessToken(t.Context(), good, []string{"nope"}); err == nil {
+		t.Fatal("audience outside the list must be rejected")
+	}
+	// No accepted audiences is a programming error, never "accept all".
+	if _, err := p.VerifyAccessToken(t.Context(), good, nil); err == nil {
+		t.Fatal("empty accepted audiences must be rejected")
+	}
+
+	expired := signES256(t, key, kid, map[string]any{
+		"iss": srv.URL, "sub": "u", "aud": "admin", "exp": time.Now().Add(-time.Hour).Unix(),
+	})
+	if _, err := p.VerifyAccessToken(t.Context(), expired, []string{"admin"}); err == nil {
+		t.Fatal("expired access token must be rejected")
+	}
+
+	// alg:none (unsigned) must be rejected before keys are consulted.
+	noneHeader := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none","typ":"JWT"}`))
+	nonePayload := base64.RawURLEncoding.EncodeToString([]byte(`{"iss":"` + srv.URL + `","sub":"u","aud":"admin","exp":` + itoa(time.Now().Add(time.Hour).Unix()) + `}`))
+	if _, err := p.VerifyAccessToken(t.Context(), noneHeader+"."+nonePayload+".", []string{"admin"}); err == nil {
+		t.Fatal("alg:none token must be rejected")
+	}
+
+	// Tampered signature must be rejected.
+	tampered := good[:len(good)-2] + "AA"
+	if _, err := p.VerifyAccessToken(t.Context(), tampered, []string{"admin"}); err == nil {
+		t.Fatal("tampered signature must be rejected")
+	}
+}
+
+func itoa(n int64) string { return strconv.FormatInt(n, 10) }
 
 func TestAuthorizeURL(t *testing.T) {
 	p := NewProvider("https://auth.example.com/", nil, time.Hour, 0)

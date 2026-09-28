@@ -136,17 +136,18 @@ func decodeSegment(seg string) ([]byte, error) {
 	return base64.RawURLEncoding.DecodeString(strings.TrimRight(seg, "="))
 }
 
-// parseAndValidateClaims validates iss/aud/exp with the given clock skew.
-func parseAndValidateClaims(payload []byte, issuer, clientID string, skew time.Duration, now time.Time) (*Claims, error) {
+// parseAndValidateClaims validates iss/aud/exp with the given clock skew. The
+// audience check passes when any of the token's aud values is in audiences.
+func parseAndValidateClaims(payload []byte, issuer string, audiences []string, skew time.Duration, now time.Time) (*Claims, error) {
 	var rc rawClaims
 	dec := json.NewDecoder(strings.NewReader(string(payload)))
 	dec.UseNumber()
 	if err := dec.Decode(&rc); err != nil {
-		return nil, fmt.Errorf("oauth: parse id_token claims: %w", err)
+		return nil, fmt.Errorf("oauth: parse token claims: %w", err)
 	}
 	issuer = strings.TrimRight(issuer, "/")
 	if rc.Issuer != issuer {
-		return nil, fmt.Errorf("oauth: id_token issuer %q does not match %q", rc.Issuer, issuer)
+		return nil, fmt.Errorf("oauth: token issuer %q does not match %q", rc.Issuer, issuer)
 	}
 	aud, err := rc.audience()
 	if err != nil {
@@ -154,26 +155,27 @@ func parseAndValidateClaims(payload []byte, issuer, clientID string, skew time.D
 	}
 	found := false
 	for _, a := range aud {
-		if a == clientID {
-			found = true
-			break
+		for _, want := range audiences {
+			if a == want {
+				found = true
+			}
 		}
 	}
 	if !found {
-		return nil, fmt.Errorf("oauth: id_token audience %v does not include %q", aud, clientID)
+		return nil, fmt.Errorf("oauth: token audience %v does not include any of %v", aud, audiences)
 	}
 	exp, err := rc.Expiry.Int64()
 	if err != nil {
-		return nil, errors.New("oauth: id_token missing/invalid exp")
+		return nil, errors.New("oauth: token missing/invalid exp")
 	}
 	expiry := time.Unix(exp, 0)
 	if now.After(expiry.Add(skew)) {
-		return nil, fmt.Errorf("oauth: id_token expired at %s", expiry.UTC().Format(time.RFC3339))
+		return nil, fmt.Errorf("oauth: token expired at %s", expiry.UTC().Format(time.RFC3339))
 	}
 	if rc.NotBef != "" {
 		if nbf, err := rc.NotBef.Int64(); err == nil {
 			if now.Add(skew).Before(time.Unix(nbf, 0)) {
-				return nil, errors.New("oauth: id_token used before nbf")
+				return nil, errors.New("oauth: token used before nbf")
 			}
 		}
 	}
@@ -184,7 +186,7 @@ func parseAndValidateClaims(payload []byte, issuer, clientID string, skew time.D
 		}
 	}
 	if c.Subject == "" {
-		return nil, errors.New("oauth: id_token missing sub")
+		return nil, errors.New("oauth: token missing sub")
 	}
 	return c, nil
 }

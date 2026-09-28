@@ -185,24 +185,51 @@ func (p *Provider) Revoke(ctx context.Context, clientID, clientSecret, token str
 
 // VerifyIDToken validates the ES256 signature and the iss/aud/exp claims.
 func (p *Provider) VerifyIDToken(ctx context.Context, raw, clientID string) (*Claims, error) {
+	payload, err := p.verifyCompactJWS(ctx, raw)
+	if err != nil {
+		return nil, err
+	}
+	return parseAndValidateClaims(payload, p.Issuer, []string{clientID}, p.Skew, p.now())
+}
+
+// VerifyAccessToken validates a client-presented bearer access token locally:
+// ES256 signature against the cached JWKS, iss == issuer, aud intersecting the
+// accepted audiences and exp/nbf within the clock skew. It never calls an
+// introspection endpoint. alg is pinned to ES256 by verifyCompactJWS, so
+// "none" and HMAC tokens are rejected before any key is consulted.
+func (p *Provider) VerifyAccessToken(ctx context.Context, raw string, audiences []string) (*Claims, error) {
+	if len(audiences) == 0 {
+		return nil, errors.New("oauth: no accepted audiences configured")
+	}
+	payload, err := p.verifyCompactJWS(ctx, raw)
+	if err != nil {
+		return nil, err
+	}
+	return parseAndValidateClaims(payload, p.Issuer, audiences, p.Skew, p.now())
+}
+
+// verifyCompactJWS checks the ES256 signature over a compact JWS and returns the
+// decoded payload. The algorithm is pinned: anything other than ES256 is
+// rejected before keys are looked up, which blocks alg-confusion and "none".
+func (p *Provider) verifyCompactJWS(ctx context.Context, raw string) ([]byte, error) {
 	parts := strings.Split(raw, ".")
 	if len(parts) != 3 {
-		return nil, errors.New("oauth: id_token is not a compact JWS")
+		return nil, errors.New("oauth: token is not a compact JWS")
 	}
 	headerBytes, err := decodeSegment(parts[0])
 	if err != nil {
-		return nil, fmt.Errorf("oauth: decode id_token header: %w", err)
+		return nil, fmt.Errorf("oauth: decode token header: %w", err)
 	}
 	var hdr jwtHeader
 	if err := json.Unmarshal(headerBytes, &hdr); err != nil {
-		return nil, fmt.Errorf("oauth: parse id_token header: %w", err)
+		return nil, fmt.Errorf("oauth: parse token header: %w", err)
 	}
 	if hdr.Alg != "ES256" {
-		return nil, fmt.Errorf("oauth: unsupported id_token alg %q (want ES256)", hdr.Alg)
+		return nil, fmt.Errorf("oauth: unsupported token alg %q (want ES256)", hdr.Alg)
 	}
 	sig, err := decodeSegment(parts[2])
 	if err != nil {
-		return nil, fmt.Errorf("oauth: decode id_token signature: %w", err)
+		return nil, fmt.Errorf("oauth: decode token signature: %w", err)
 	}
 	signingInput := []byte(parts[0] + "." + parts[1])
 
@@ -222,15 +249,15 @@ func (p *Provider) VerifyIDToken(ctx context.Context, raw, clientID string) (*Cl
 			return nil, fmt.Errorf("oauth: no JWKS key matches kid %q", hdr.Kid)
 		}
 		if !verifySignature(pub, signingInput, sig) {
-			return nil, errors.New("oauth: id_token signature verification failed")
+			return nil, errors.New("oauth: token signature verification failed")
 		}
 	}
 
 	payload, err := decodeSegment(parts[1])
 	if err != nil {
-		return nil, fmt.Errorf("oauth: decode id_token payload: %w", err)
+		return nil, fmt.Errorf("oauth: decode token payload: %w", err)
 	}
-	return parseAndValidateClaims(payload, p.Issuer, clientID, p.Skew, p.now())
+	return payload, nil
 }
 
 func (p *Provider) now() time.Time {
