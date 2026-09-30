@@ -14,10 +14,22 @@ cp config.example.yaml config.yaml   # 按部署环境填写
 ./bin/auth-gateway -config config.yaml
 ```
 
-环境变量可覆盖部分配置：`GATEWAY_CONFIG`、`GATEWAY_LISTEN`、`GATEWAY_ISSUER`、
-`GATEWAY_REDIS_ADDR`、`GATEWAY_REDIS_DB`。
-
 配置缺失或密钥文件不存在时进程直接报错退出，不会退化为明文或危险默认值。
+`listen` 只接受回环地址，网关由 nginx 反代进来，不直接对外。
+
+## 环境变量
+
+环境变量覆盖 YAML 中的对应项；默认值取自代码：
+
+| 名称 | 默认值 | 说明 |
+|---|---|---|
+| `GATEWAY_CONFIG` | `config.yaml` | 配置文件路径 |
+| `GATEWAY_LISTEN` | 无（`listen` 必填） | 覆盖 `listen` |
+| `GATEWAY_ISSUER` | 无（`issuer` 必填） | 覆盖 `issuer` |
+| `GATEWAY_REDIS_ADDR` | 无（`redis.addr` 必填） | 覆盖 `redis.addr` |
+| `GATEWAY_REDIS_DB` | `2` | 覆盖 `redis.db`，范围 0..15 |
+
+其余键（`session`、`token`、`audit`、`apps`）的示例见 `config.example.yaml`。
 
 ## 关键行为
 
@@ -30,7 +42,8 @@ cp config.example.yaml config.yaml   # 按部署环境填写
 - 反代：只转发到配置白名单；先删除客户端身份头再注入 `X-Auth-User/App/Sid`；
   转发前剥掉网关自身 cookie；支持 WebSocket 与流式大文件；`proxy` 模式注入 Bearer。
 - Redis：DB 默认 2，键带 `gw:` 前缀；`state` 一次性消费 TTL 10 分钟；会话 7 天滑动。
-- Token：AES-GCM 加密存放，密钥来自 0600 文件。
+- Token：AES-256-GCM 加密后存 Redis，密钥读自 `token.encryption_key_file`（部署时按 0600 放置）。
+- 审计：`audit.file` 为必填，追加写入登录 / 登出 / 拒绝 / 刷新事件，不记 token 与 cookie 值。
 
 ## 两条身份通道：网页 cookie / 原生 APP Bearer
 
@@ -62,3 +75,13 @@ go test ./...
 
 `cmd/mocksso` 与 `cmd/echoupstream` 是自测专用假服务，`test/wsprobe` 是原始
 WebSocket 探针，均不可部署。
+
+## 部署
+
+构建产物是单个二进制 `bin/auth-gateway`。仓库不含 systemd 单元；进程只绑定回环地址，
+外层由 nginx 终止 TLS 并反代到 `listen`。运行时需可达 `issuer`（OIDC 端点）与 `redis.addr`。
+配置文件、`*.secret` 与 `token.key` 均不入库（见 `.gitignore`）。
+
+## 许可证
+
+MIT，见 `LICENSE`。
