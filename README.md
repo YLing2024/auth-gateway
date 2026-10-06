@@ -1,3 +1,5 @@
+[简体中文](README.md) ｜ [English](README.en.md)
+
 # auth-gateway
 
 单体 Go 二进制的 SSO 认证网关：终结网关会话 cookie，通过 OIDC + PKCE 完成登录，
