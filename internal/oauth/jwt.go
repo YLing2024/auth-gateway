@@ -20,6 +20,7 @@ type Claims struct {
 	Audience []string
 	Name     string
 	JTI      string
+	Sid      string
 	Expiry   time.Time
 	IssuedAt time.Time
 }
@@ -30,6 +31,7 @@ type rawClaims struct {
 	Audience json.RawMessage `json:"aud"`
 	Name     string          `json:"name"`
 	JTI      string          `json:"jti"`
+	Sid      string          `json:"sid"`
 	Expiry   json.Number     `json:"exp"`
 	NotBef   json.Number     `json:"nbf"`
 	IssuedAt json.Number     `json:"iat"`
@@ -179,7 +181,7 @@ func parseAndValidateClaims(payload []byte, issuer string, audiences []string, s
 			}
 		}
 	}
-	c := &Claims{Issuer: rc.Issuer, Subject: rc.Subject, Audience: aud, Name: rc.Name, JTI: rc.JTI, Expiry: expiry}
+	c := &Claims{Issuer: rc.Issuer, Subject: rc.Subject, Audience: aud, Name: rc.Name, JTI: rc.JTI, Sid: rc.Sid, Expiry: expiry}
 	if rc.IssuedAt != "" {
 		if iat, err := rc.IssuedAt.Int64(); err == nil {
 			c.IssuedAt = time.Unix(iat, 0)

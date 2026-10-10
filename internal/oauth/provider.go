@@ -197,6 +197,25 @@ func (p *Provider) Revoke(ctx context.Context, clientID, clientSecret, token str
 	return nil
 }
 
+// Probe checks that the issuer is reachable by requesting its discovery
+// document. Only reachability matters: any HTTP response (even 3xx/5xx) counts
+// as reachable, and only a transport error or timeout is reported as
+// unreachable. The caller bounds the time with a context.
+func (p *Provider) Probe(ctx context.Context) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.Issuer+"/.well-known/openid-configuration", nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Accept", "application/json")
+	resp, err := p.Client.Do(req)
+	if err != nil {
+		return fmt.Errorf("oauth: issuer probe: %w", err)
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<16))
+	return nil
+}
+
 // VerifyIDToken validates the ES256 signature and the iss/aud/exp claims.
 func (p *Provider) VerifyIDToken(ctx context.Context, raw, clientID string) (*Claims, error) {
 	payload, err := p.verifyCompactJWS(ctx, raw)

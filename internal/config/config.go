@@ -46,16 +46,18 @@ const AuthNone = "none"
 
 // Config is the fully resolved gateway configuration.
 type Config struct {
-	Listen         string        `yaml:"listen"`
-	Issuer         string        `yaml:"issuer"`
-	LogoutRedirect string        `yaml:"logout_redirect"`
-	Redis          RedisConfig   `yaml:"redis"`
-	Session        SessionConfig `yaml:"session"`
-	Token          TokenConfig   `yaml:"token"`
-	Audit          AuditConfig   `yaml:"audit"`
-	Apps           []AppConfig   `yaml:"apps"`
+	Listen         string            `yaml:"listen"`
+	Issuer         string            `yaml:"issuer"`
+	LogoutRedirect string            `yaml:"logout_redirect"`
+	Redis          RedisConfig       `yaml:"redis"`
+	Session        SessionConfig     `yaml:"session"`
+	Token          TokenConfig       `yaml:"token"`
+	Audit          AuditConfig       `yaml:"audit"`
+	Backchannel    BackchannelConfig `yaml:"backchannel"`
+	Apps           []AppConfig       `yaml:"apps"`
 
-	tokenKey []byte
+	tokenKey         []byte
+	backchannelToken []byte
 }
 
 // RedisConfig describes the Redis connection. DB is a pointer so that "absent"
@@ -85,6 +87,19 @@ type TokenConfig struct {
 type AuditConfig struct {
 	File          string `yaml:"file"`
 	RetentionDays int    `yaml:"retention_days"`
+}
+
+// BackchannelConfig configures the loopback endpoint the auth centre calls
+// after a global logout to tell the gateway to drop every session from one
+// login. Authentication reuses the auth centre's shared internal token file.
+type BackchannelConfig struct {
+	// InternalTokenFile is the same shared secret file the auth centre writes
+	// (default <DATA_DIR>/internal-token, 0600). Empty means the endpoint can
+	// never authenticate: it fails closed with 401.
+	InternalTokenFile string `yaml:"internal_token_file"`
+	// Enabled gates the endpoint. Absent defaults to true; false makes the
+	// endpoint return 404 (grey release / rollback).
+	Enabled *bool `yaml:"enabled"`
 }
 
 // AppConfig is one protected site.
@@ -392,6 +407,10 @@ func (c *Config) normalizeAndValidate() error {
 	if strings.TrimSpace(c.Audit.File) == "" {
 		errs = append(errs, "audit.file is required")
 	}
+	if c.Backchannel.Enabled == nil {
+		enabled := true // default on; only an explicit false disables the endpoint
+		c.Backchannel.Enabled = &enabled
+	}
 	if strings.TrimSpace(c.LogoutRedirect) == "" {
 		c.LogoutRedirect = "/"
 	}
@@ -426,8 +445,27 @@ func (c *Config) loadSecrets() error {
 		}
 		c.tokenKey = key
 	}
+	if p := strings.TrimSpace(c.Backchannel.InternalTokenFile); p != "" {
+		b, err := os.ReadFile(p)
+		if err != nil {
+			return fmt.Errorf("config: backchannel.internal_token_file: %w", err)
+		}
+		s := strings.TrimSpace(string(b))
+		if s == "" {
+			return errors.New("config: backchannel.internal_token_file is empty")
+		}
+		c.backchannelToken = []byte(s)
+	}
 	return nil
 }
+
+// BackchannelEnabled reports whether the back-channel logout endpoint is live.
+func (c *Config) BackchannelEnabled() bool {
+	return c.Backchannel.Enabled != nil && *c.Backchannel.Enabled
+}
+
+// BackchannelToken returns the shared internal token bytes (nil when unset).
+func (c *Config) BackchannelToken() []byte { return c.backchannelToken }
 
 // TokenKey returns the AES key material used to encrypt stored tokens.
 func (c *Config) TokenKey() []byte { return c.tokenKey }

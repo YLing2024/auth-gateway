@@ -362,3 +362,45 @@ apps:
 		t.Fatal("duplicate route prefix must be rejected")
 	}
 }
+
+func TestBackchannelDefaultsEnabled(t *testing.T) {
+	dir := t.TempDir()
+	secret := write(t, dir, "android.secret", "s3cr3t-value")
+	cfg, err := loadYAML(t, strings.Replace(baseYAML, "%s", secret, 1))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.BackchannelEnabled() {
+		t.Fatal("backchannel must default to enabled")
+	}
+	if cfg.BackchannelToken() != nil {
+		t.Fatal("unset internal_token_file must leave the token empty (fail closed)")
+	}
+}
+
+func TestBackchannelTokenLoadedAndDisableable(t *testing.T) {
+	dir := t.TempDir()
+	secret := write(t, dir, "android.secret", "s3cr3t-value")
+	tok := write(t, dir, "internal-token", "shared-internal-token\n")
+	body := strings.Replace(baseYAML, "%s", secret, 1) +
+		"backchannel:\n  internal_token_file: " + tok + "\n"
+	cfg, err := loadYAML(t, body)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.BackchannelEnabled() {
+		t.Fatal("expected enabled by default")
+	}
+	if got := string(cfg.BackchannelToken()); got != "shared-internal-token" {
+		t.Fatalf("token = %q, want trimmed value", got)
+	}
+
+	off := strings.Replace(baseYAML, "%s", secret, 1) + "backchannel:\n  enabled: false\n"
+	cfg2, err := loadYAML(t, off)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg2.BackchannelEnabled() {
+		t.Fatal("explicit enabled: false must disable the endpoint")
+	}
+}

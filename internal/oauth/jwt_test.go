@@ -43,6 +43,17 @@ func jwksFor(key *ecdsa.PrivateKey, kid string) []byte {
 	return b
 }
 
+func TestParseClaimsSid(t *testing.T) {
+	payload := []byte(`{"iss":"https://auth.example.com","sub":"u","aud":"appa","exp":9999999999,"sid":"sid-abc-123"}`)
+	c, err := parseAndValidateClaims(payload, "https://auth.example.com", []string{"appa"}, 0, time.Unix(1000, 0))
+	if err != nil {
+		t.Fatalf("parseAndValidateClaims: %v", err)
+	}
+	if c.Sid != "sid-abc-123" {
+		t.Fatalf("Sid = %q, want sid-abc-123", c.Sid)
+	}
+}
+
 func TestVerifyIDToken(t *testing.T) {
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {

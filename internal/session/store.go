@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -24,6 +25,11 @@ type Session struct {
 	AccessToken  string `json:"access_token,omitempty"`  // encrypted at rest
 	RefreshToken string `json:"refresh_token,omitempty"` // encrypted at rest
 	OriginalURL  string `json:"original_url,omitempty"`
+
+	// Sid is the OIDC session id (the id_token "sid" claim). It links every
+	// gateway session minted from the same login so a global logout can drop
+	// them all. Empty when the issuer did not supply one; never blocks login.
+	Sid string `json:"sid,omitempty"`
 
 	// SID is not serialized; it is the Redis key component.
 	SID string `json:"-"`
@@ -84,7 +90,9 @@ func (s *Store) TakeState(state string) (State, bool, error) {
 
 // ── session ──────────────────────────────────────────────────────────────
 
-// PutSession encrypts token fields and stores the session.
+// PutSession encrypts token fields and stores the session. It also registers
+// the session under its OIDC sid index (when present) so a global logout can
+// find and delete every session from the same login.
 func (s *Store) PutSession(sid string, v Session, ttl time.Duration) error {
 	enc := v
 	var err error
@@ -98,7 +106,13 @@ func (s *Store) PutSession(sid string, v Session, ttl time.Duration) error {
 	if err != nil {
 		return err
 	}
-	return s.r.SetEX(s.key("sess", sid), string(body), ttl)
+	if err := s.r.SetEX(s.key("sess", sid), string(body), ttl); err != nil {
+		return err
+	}
+	if v.Sid != "" {
+		return s.indexSid(v.Sid, sid, ttl)
+	}
+	return nil
 }
 
 // GetSession loads a session and slides its TTL to the full session lifetime.
@@ -124,9 +138,85 @@ func (s *Store) GetSession(sid string) (Session, bool, error) {
 	return out, true, nil
 }
 
-// DeleteSession removes a session immediately (logout).
+// DeleteSession removes a session immediately (logout). It also removes the
+// session from its OIDC sid index so a later back-channel logout never sees a
+// dangling id.
 func (s *Store) DeleteSession(sid string) error {
+	if oidcSid := s.sessionSid(sid); oidcSid != "" {
+		if err := s.r.SRem(s.sidIndexKey(oidcSid), sid); err != nil {
+			return err
+		}
+	}
 	return s.r.Del(s.key("sess", sid))
+}
+
+// sessionSid reads only the plaintext sid field of a stored session, without
+// decrypting tokens or sliding the TTL. Returns "" when absent or unreadable.
+func (s *Store) sessionSid(sid string) string {
+	raw, ok, err := s.r.Get(s.key("sess", sid))
+	if err != nil || !ok {
+		return ""
+	}
+	var probe struct {
+		Sid string `json:"sid"`
+	}
+	if json.Unmarshal([]byte(raw), &probe) != nil {
+		return ""
+	}
+	return probe.Sid
+}
+
+// ── sid index (global logout) ────────────────────────────────────────────
+
+func (s *Store) sidIndexKey(oidcSid string) string { return s.key("sid", oidcSid) }
+
+// indexSid registers a gateway session id under an OIDC sid, with the index TTL
+// aligned to the session lifetime.
+func (s *Store) indexSid(oidcSid, sessionID string, ttl time.Duration) error {
+	k := s.sidIndexKey(oidcSid)
+	if err := s.r.SAdd(k, sessionID); err != nil {
+		return err
+	}
+	return s.r.Expire(k, ttl)
+}
+
+// SessionsBySid returns the gateway session ids registered under one OIDC sid.
+func (s *Store) SessionsBySid(oidcSid string) ([]string, error) {
+	return s.r.SMembers(s.sidIndexKey(oidcSid))
+}
+
+// DropSidIndex deletes the sid index set itself.
+func (s *Store) DropSidIndex(oidcSid string) error {
+	return s.r.Del(s.sidIndexKey(oidcSid))
+}
+
+// SessionsBySub returns every gateway session id belonging to a subject. It is
+// the fallback path for {"sub":..,"all":true}; the auth centre does not send it
+// by default. Sessions are located by scanning the session key prefix and
+// reading only the plaintext sub field.
+func (s *Store) SessionsBySub(sub string) ([]string, error) {
+	keys, err := s.r.Scan(s.key("sess", "*"))
+	if err != nil {
+		return nil, err
+	}
+	prefix := s.key("sess", "")
+	out := make([]string, 0, len(keys))
+	for _, k := range keys {
+		raw, ok, err := s.r.Get(k)
+		if err != nil || !ok {
+			continue
+		}
+		var probe struct {
+			Sub string `json:"sub"`
+		}
+		if json.Unmarshal([]byte(raw), &probe) != nil || probe.Sub != sub {
+			continue
+		}
+		if id := strings.TrimPrefix(k, prefix); id != "" {
+			out = append(out, id)
+		}
+	}
+	return out, nil
 }
 
 // ── revoked tokens ───────────────────────────────────────────────────────
@@ -212,4 +302,63 @@ func (r *Redis) Expire(key string, ttl time.Duration) error {
 	}
 	_, err := r.Do("EXPIRE", key, strconv.Itoa(secs))
 	return err
+}
+
+// SAdd adds member to a set.
+func (r *Redis) SAdd(key, member string) error {
+	_, err := r.Do("SADD", key, member)
+	return err
+}
+
+// SRem removes member from a set.
+func (r *Redis) SRem(key, member string) error {
+	_, err := r.Do("SREM", key, member)
+	return err
+}
+
+// SMembers returns the members of a set.
+func (r *Redis) SMembers(key string) ([]string, error) {
+	v, err := r.Do("SMEMBERS", key)
+	if err != nil {
+		return nil, err
+	}
+	arr, ok := v.([]any)
+	if !ok {
+		return nil, nil
+	}
+	out := make([]string, 0, len(arr))
+	for _, m := range arr {
+		if s, ok := m.(string); ok {
+			out = append(out, s)
+		}
+	}
+	return out, nil
+}
+
+// Scan walks all keys matching a glob pattern using SCAN. It never uses KEYS,
+// so it stays safe on a shared Redis instance.
+func (r *Redis) Scan(match string) ([]string, error) {
+	var out []string
+	cursor := "0"
+	for {
+		v, err := r.Do("SCAN", cursor, "MATCH", match, "COUNT", "200")
+		if err != nil {
+			return nil, err
+		}
+		arr, ok := v.([]any)
+		if !ok || len(arr) != 2 {
+			return out, nil
+		}
+		next, _ := arr[0].(string)
+		keys, _ := arr[1].([]any)
+		for _, k := range keys {
+			if s, ok := k.(string); ok {
+				out = append(out, s)
+			}
+		}
+		if next == "0" || next == "" {
+			return out, nil
+		}
+		cursor = next
+	}
 }
