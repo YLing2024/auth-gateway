@@ -78,10 +78,10 @@ func TestBackchannelEndpointGating(t *testing.T) {
 
 func TestIsLoopback(t *testing.T) {
 	cases := map[string]bool{
-		"127.0.0.1:1234": true,
-		"[::1]:1234":     true,
-		"203.0.113.5:80": false,
-		"10.0.0.1:80":    false,
+		"127.0.0.1:1234":  true,
+		"[::1]:1234":      true,
+		"203.0.113.5:80":  false,
+		"198.51.100.9:80": false,
 	}
 	for addr, want := range cases {
 		if got := isLoopback(addr); got != want {
