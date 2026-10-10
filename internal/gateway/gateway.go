@@ -8,8 +8,11 @@ package gateway
 
 import (
 	"context"
+	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -35,6 +38,10 @@ type Gateway struct {
 	stateTTL time.Duration
 	sessTTL  time.Duration
 	logf     *log.Logger
+
+	// Back-channel logout endpoint state, cached from config at assembly time.
+	bcEnabled bool
+	bcToken   []byte
 }
 
 type appRoute struct {
@@ -79,6 +86,9 @@ func New(cfg *config.Config, store *session.Store, provider *oauth.Provider, al 
 		stateTTL: time.Duration(cfg.Session.StateTTLMinutes) * time.Minute,
 		sessTTL:  time.Duration(cfg.Session.TTLHours) * time.Hour,
 		logf:     logger,
+
+		bcEnabled: cfg.BackchannelEnabled(),
+		bcToken:   cfg.BackchannelToken(),
 	}
 	for _, ac := range cfg.Apps {
 		ar := &appRoute{cfg: ac, cookieName: session.CookieName(ac.ID, cfg.Session.CookieSuffix)}
@@ -114,6 +124,9 @@ func (g *Gateway) Handler() http.Handler {
 	mux.HandleFunc("/_auth/callback", g.handleCallback)
 	mux.HandleFunc("/_auth/logout", g.handleLogout)
 	mux.HandleFunc("/_auth/me", g.handleMe)
+	// Global-logout back channel: anonymous, loopback-only, internal-token
+	// authenticated. It must be registered before the /_auth/ catch-all.
+	mux.HandleFunc("/_auth/backchannel-logout", g.handleBackchannelLogout)
 	// Everything else under /_auth/ is cargo-cult noise: 404, do not proxy.
 	mux.HandleFunc("/_auth/", func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "not found", http.StatusNotFound)
@@ -213,6 +226,7 @@ func (g *Gateway) handleCallback(w http.ResponseWriter, r *http.Request) {
 		App:         app.cfg.ID,
 		Sub:         claims.Subject,
 		Name:        claims.Name,
+		Sid:         claims.Sid,
 		Exp:         claims.Expiry.Unix(),
 		OriginalURL: st.OriginalURL,
 	}
@@ -313,10 +327,137 @@ func (g *Gateway) handleLogout(w http.ResponseWriter, r *http.Request) {
 	}
 	session.ClearSessionCookie(w, app.cookieName)
 	if target, ok := g.endSessionTarget(app, revoke); ok {
-		http.Redirect(w, r, target, http.StatusFound)
-		return
+		// Only probe when we are actually about to hand the browser to the
+		// issuer. In protect mode the session holds no tokens, so a failed
+		// revocation cannot signal an unreachable issuer; the probe closes that
+		// gap and keeps the user off the issuer's connection-error page.
+		if g.issuerReachable(r.Context()) {
+			http.Redirect(w, r, target, http.StatusFound)
+			return
+		}
+		g.logf.Printf("logout: issuer unreachable, falling back to local redirect")
 	}
 	http.Redirect(w, r, g.cfg.LogoutRedirect, http.StatusFound)
+}
+
+// issuerProbeTimeout bounds the reachability probe so it stays inside the
+// user-perceived logout budget (< 3s).
+const issuerProbeTimeout = 2 * time.Second
+
+// issuerReachable reports whether the issuer's discovery endpoint answered at
+// all. Any HTTP response counts as reachable; only a transport error or timeout
+// is unreachable. The probe failure never changes the logout outcome.
+func (g *Gateway) issuerReachable(ctx context.Context) bool {
+	ctx, cancel := context.WithTimeout(ctx, issuerProbeTimeout)
+	defer cancel()
+	return g.provider.Probe(ctx) == nil
+}
+
+// ── back-channel logout ───────────────────────────────────────────────────
+
+// backchannelRequest is the JSON body the auth centre posts after it has
+// revoked one login. Sid targets every session minted from that login; the
+// {sub, all} pair is an explicit fallback the auth centre does not send by
+// default.
+type backchannelRequest struct {
+	Sid string `json:"sid"`
+	Sub string `json:"sub"`
+	All bool   `json:"all"`
+}
+
+// handleBackchannelLogout drops every gateway session belonging to one OIDC
+// sid (or, on the explicit fallback, one subject). It is anonymous and lives
+// under /_auth/ so it runs before any session check and never creates one.
+//
+// Authentication requires BOTH a loopback source and a constant-time match of
+// the X-Internal-Token header against the shared token file. Any failure is a
+// bare 401 that never explains which check failed.
+func (g *Gateway) handleBackchannelLogout(w http.ResponseWriter, r *http.Request) {
+	if !g.bcEnabled {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !isLoopback(r.RemoteAddr) || !g.backchannelTokenOK(r.Header.Get("X-Internal-Token")) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<16))
+	if err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	var req backchannelRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if req.Sid == "" && !(req.All && req.Sub != "") {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if req.Sid != "" {
+		g.dropSessionsBySid(req.Sid)
+	}
+	if req.All && req.Sub != "" {
+		g.dropSessionsBySub(req.Sub)
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// backchannelTokenOK compares the provided token against the configured one in
+// constant time over fixed-length SHA-256 digests. An unset configured token
+// can never match (fail closed).
+func (g *Gateway) backchannelTokenOK(provided string) bool {
+	if len(g.bcToken) == 0 || provided == "" {
+		return false
+	}
+	got := sha256.Sum256([]byte(provided))
+	wantSum := sha256.Sum256(g.bcToken)
+	return subtle.ConstantTimeCompare(got[:], wantSum[:]) == 1
+}
+
+// dropSessionsBySid deletes every session registered under one OIDC sid and
+// then removes the index itself. Unknown sid is a no-op (idempotent).
+func (g *Gateway) dropSessionsBySid(oidcSid string) {
+	ids, err := g.store.SessionsBySid(oidcSid)
+	if err != nil {
+		g.logf.Printf("backchannel: list sid: %v", err)
+		return
+	}
+	for _, id := range ids {
+		g.dropOneSession(id)
+	}
+	if err := g.store.DropSidIndex(oidcSid); err != nil {
+		g.logf.Printf("backchannel: drop sid index: %v", err)
+	}
+}
+
+// dropSessionsBySub deletes every session belonging to one subject (fallback).
+func (g *Gateway) dropSessionsBySub(sub string) {
+	ids, err := g.store.SessionsBySub(sub)
+	if err != nil {
+		g.logf.Printf("backchannel: list sub: %v", err)
+		return
+	}
+	for _, id := range ids {
+		g.dropOneSession(id)
+	}
+}
+
+// dropOneSession audits and deletes one gateway session. The per-app cookie is
+// not rewritten here: it simply stops resolving on the next request.
+func (g *Gateway) dropOneSession(id string) {
+	if sess, ok, err := g.store.GetSession(id); err == nil && ok {
+		g.audit.Log(sess.App, sess.Sub, "logout", "ok:backchannel")
+	}
+	if err := g.store.DeleteSession(id); err != nil {
+		g.logf.Printf("backchannel: delete session: %v", err)
+	}
 }
 
 // ── me ───────────────────────────────────────────────────────────────────
