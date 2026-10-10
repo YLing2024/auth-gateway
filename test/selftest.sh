@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Offline self-test for the auth-gateway (BRIEF section 3).
 #
-# Everything runs on loopback with private ports 18930/18931/18932 and Redis
+# Everything runs on loopback with private ports 18930/18931/18932 (override
+# with SELFTEST_GW_ADDR / SELFTEST_SSO_ADDR / SELFTEST_UP_ADDR) and Redis
 # DB 2 using the dedicated prefix gw:selftest:. No real SSO, no production
 # ports and no systemd are touched. Requires: go, curl, redis-cli, ss.
 set -u
@@ -10,15 +11,17 @@ set -o pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/authgw-selftest.XXXXXX")"
 
-GW_ADDR="127.0.0.1:18930"
-SSO_ADDR="127.0.0.1:18931"
-UP_ADDR="127.0.0.1:18932"
-HOST_A="a.example.com:18930"
-HOST_B="b.example.com:18930"
-HOST_V2="v2.example.com:18930"
-HOST_R="r.example.com:18930"
-HOST_NR="nr.example.com:18930"
-HOST_BEAR="bear.example.com:18930"
+GW_ADDR="${SELFTEST_GW_ADDR:-127.0.0.1:18930}"
+SSO_ADDR="${SELFTEST_SSO_ADDR:-127.0.0.1:18931}"
+UP_ADDR="${SELFTEST_UP_ADDR:-127.0.0.1:18932}"
+BAD_PORT="${SELFTEST_BAD_PORT:-18940}"
+GW_PORT="${GW_ADDR##*:}"
+HOST_A="a.example.com:${GW_PORT}"
+HOST_B="b.example.com:${GW_PORT}"
+HOST_V2="v2.example.com:${GW_PORT}"
+HOST_R="r.example.com:${GW_PORT}"
+HOST_NR="nr.example.com:${GW_PORT}"
+HOST_BEAR="bear.example.com:${GW_PORT}"
 PREFIX="gw:selftest:"
 
 PASS=0
@@ -224,7 +227,7 @@ check_contains "2.4 清 cookie Max-Age=0" "Max-Age=0" "$C2COOKIE"
 
 title "3) 完整登录流程（login → authorize → token → callback）"
 printf '$ curl -sS -o /dev/null -D - -H %s http://%s/_auth/login?next=%%2Fdeep%%2Fpage%%3Fx%%3D1\n' \
-  "'Host: a.example.com:18930'" "$GW_ADDR"
+  "'Host: a.example.com:${GW_PORT}'" "$GW_ADDR"
 curl -sS -o /dev/null -D "$TMP/c3a.hdr" -H "Host: $HOST_A" "http://$GW_ADDR/_auth/login?next=%2Fdeep%2Fpage%3Fx%3D1"
 cat "$TMP/c3a.hdr"
 AUTH_URL="$(header_value "$TMP/c3a.hdr" Location)"
@@ -241,8 +244,8 @@ CB_URL="$(header_value "$TMP/c3b.hdr" Location)"
 check_eq "3.5 authorize 状态码 302" "302" "$(status_of "$TMP/c3b.hdr")"
 check_contains "3.6 回调 URL 指向 /_auth/callback" "/_auth/callback?" "$CB_URL"
 
-printf '$ curl -sS --resolve %s -o /dev/null -D - %s\n' "a.example.com:18930:127.0.0.1" "$CB_URL"
-curl -sS --resolve "a.example.com:18930:127.0.0.1" -o /dev/null -D "$TMP/c3c.hdr" "$CB_URL"
+printf '$ curl -sS --resolve %s -o /dev/null -D - %s\n' "a.example.com:${GW_PORT}:127.0.0.1" "$CB_URL"
+curl -sS --resolve "a.example.com:${GW_PORT}:127.0.0.1" -o /dev/null -D "$TMP/c3c.hdr" "$CB_URL"
 cat "$TMP/c3c.hdr"
 C3COOKIE="$(cookie_header "$TMP/c3c.hdr")"
 SID_A="$(printf '%s' "$C3COOKIE" | sed -n 's/.*__Host-appa_session=\([^;]*\).*/\1/p')"
@@ -259,7 +262,7 @@ check_contains "3.15 Max-Age 7 天" "Max-Age=604800" "$C3COOKIE"
 # ── 4. access with cookie ────────────────────────────────────────────────
 
 title "4) 带 cookie 访问 → 200，上游收到 X-Auth-User"
-printf '$ curl -sS -H %s -H %s http://%s/dash\n' "'Host: a.example.com:18930'" \
+printf '$ curl -sS -H %s -H %s http://%s/dash\n' "'Host: a.example.com:${GW_PORT}'" \
   "'Cookie: __Host-appa_session=<sid>'" "$GW_ADDR"
 curl -sS -o "$TMP/c4.body" -w 'http_status=%{http_code}\n' -H "Host: $HOST_A" \
   -H "Cookie: __Host-appa_session=$SID_A" "http://$GW_ADDR/dash"
@@ -272,7 +275,7 @@ check_eq "4.3 X-Auth-Sid 正确" "$SID_A" "$(json_str "$TMP/c4.body" x_auth_sid)
 
 title "5) 伪造 X-Auth-User: root → 被剥掉，上游只看到网关注入值"
 printf '$ curl -sS -H %s -H %s -H %s -H %s http://%s/dash\n' \
-  "'Host: a.example.com:18930'" "'Cookie: __Host-appa_session=<sid>'" \
+  "'Host: a.example.com:${GW_PORT}'" "'Cookie: __Host-appa_session=<sid>'" \
   "'X-Auth-User: root'" "'Accept: application/json'" "$GW_ADDR"
 curl -sS -o "$TMP/c5.body" -H "Host: $HOST_A" -H "Cookie: __Host-appa_session=$SID_A" \
   -H 'X-Auth-User: root' -H 'X-Auth-Email: root@example.com' -H 'X-Real-IP: 203.0.113.7' \
@@ -287,11 +290,11 @@ check_not_contains "5.4 网关 cookie 未转发给上游" "__Host-appa_session" 
 
 title "6) state 重放 / 乱写 → 400"
 printf '$ curl -sS -o /dev/null -w %%{http_code} -H %s "http://%s/_auth/callback?state=%s&code=x"\n' \
-  "'Host: a.example.com:18930'" "$GW_ADDR" "$STATE_A"
+  "'Host: a.example.com:${GW_PORT}'" "$GW_ADDR" "$STATE_A"
 REPLAY="$(curl -sS -o /dev/null -w '%{http_code}' -H "Host: $HOST_A" "http://$GW_ADDR/_auth/callback?state=${STATE_A}&code=x")"
 echo "replay(${STATE_A:0:8}...): $REPLAY"
 printf '$ curl -sS -o /dev/null -w %%{http_code} -H %s "http://%s/_auth/callback?state=bogus&code=x"\n' \
-  "'Host: a.example.com:18930'" "$GW_ADDR"
+  "'Host: a.example.com:${GW_PORT}'" "$GW_ADDR"
 BOGUS="$(curl -sS -o /dev/null -w '%{http_code}' -H "Host: $HOST_A" "http://$GW_ADDR/_auth/callback?state=bogus&code=x")"
 echo "bogus: $BOGUS"
 check_eq "6.1 已消费 state 重放 → 400" "400" "$REPLAY"
@@ -301,7 +304,7 @@ check_eq "6.2 乱写 state → 400" "400" "$BOGUS"
 
 title "7) 跨 app 隔离：A 的 cookie 访问 B → 不认"
 printf '$ curl -sS -o body -w %%{http_code} -H %s -H %s -H %s http://%s/api/me\n' \
-  "'Host: b.example.com:18930'" "'Cookie: __Host-appa_session=<A-sid>'" "'Accept: application/json'" "$GW_ADDR"
+  "'Host: b.example.com:${GW_PORT}'" "'Cookie: __Host-appa_session=<A-sid>'" "'Accept: application/json'" "$GW_ADDR"
 C7="$(curl -sS -o "$TMP/c7.body" -w '%{http_code}' -H "Host: $HOST_B" \
   -H "Cookie: __Host-appa_session=$SID_A" -H 'Accept: application/json' "http://$GW_ADDR/api/me")"
 echo "status=$C7 body=$(cat "$TMP/c7.body")"
@@ -320,7 +323,7 @@ check_contains "8.2 回显成功" "ECHO hello-ws" "$WS_OUT"
 
 title "9) 大文件 50MB 流式转发（不 OOM）"
 printf '$ curl -sS -o big.out -w %s -H %s -H %s "http://%s/big?mb=50"\n' \
-  "'http=%{http_code} bytes=%{size_download}'" "'Host: a.example.com:18930'" \
+  "'http=%{http_code} bytes=%{size_download}'" "'Host: a.example.com:${GW_PORT}'" \
   "'Cookie: __Host-appa_session=<sid>'" "$GW_ADDR"
 BIG="$(curl -sS -o "$TMP/big.out" -w 'http=%{http_code} bytes=%{size_download} time=%{time_total}s' \
   -H "Host: $HOST_A" -H "Cookie: __Host-appa_session=$SID_A" "http://$GW_ADDR/big?mb=50")"
@@ -345,12 +348,12 @@ curl -sS -o /dev/null -D "$TMP/b1.hdr" -H "Host: $HOST_B" "http://$GW_ADDR/_auth
 B_AUTH="$(header_value "$TMP/b1.hdr" Location)"
 curl -sS -o /dev/null -D "$TMP/b2.hdr" "$B_AUTH"
 B_CB="$(header_value "$TMP/b2.hdr" Location)"
-curl -sS --resolve "b.example.com:18930:127.0.0.1" -o /dev/null -D "$TMP/b3.hdr" "$B_CB"
+curl -sS --resolve "b.example.com:${GW_PORT}:127.0.0.1" -o /dev/null -D "$TMP/b3.hdr" "$B_CB"
 SID_B="$(cookie_header "$TMP/b3.hdr" | sed -n 's/.*__Host-appb_session=\([^;]*\).*/\1/p')"
 echo "logged in B: sid=${SID_B:0:8}... status=$(status_of "$TMP/b3.hdr")"
 
 printf '$ curl -sS -o /dev/null -D - -H %s -H %s http://%s/_auth/logout\n' \
-  "'Host: a.example.com:18930'" "'Cookie: __Host-appa_session=<A-sid>'" "$GW_ADDR"
+  "'Host: a.example.com:${GW_PORT}'" "'Cookie: __Host-appa_session=<A-sid>'" "$GW_ADDR"
 curl -sS -o /dev/null -D "$TMP/c10.hdr" -H "Host: $HOST_A" -H "Cookie: __Host-appa_session=$SID_A" "http://$GW_ADDR/_auth/logout"
 cat "$TMP/c10.hdr"
 LO_COOKIE="$(cookie_header "$TMP/c10.hdr")"
@@ -380,14 +383,14 @@ check_eq "11.1 未配置 host 返回 404" "404" "$WL"
 
 title "12) 可达性：只绑 127.0.0.1"
 printf '$ ss -ltn | grep %s\n' "$GW_ADDR"
-ss -ltn | grep "18930" || true
-LISTEN="$(ss -ltn | awk '{print $4}' | grep '18930' || true)"
-check_contains "12.1 监听在 127.0.0.1" "127.0.0.1:18930" "$LISTEN"
-check_not_contains "12.2 未监听 0.0.0.0" "0.0.0.0:18930" "$LISTEN"
+ss -ltn | grep "$GW_PORT" || true
+LISTEN="$(ss -ltn | awk '{print $4}' | grep "$GW_PORT" || true)"
+check_contains "12.1 监听在 127.0.0.1" "127.0.0.1:${GW_PORT}" "$LISTEN"
+check_not_contains "12.2 未监听 0.0.0.0" "0.0.0.0:${GW_PORT}" "$LISTEN"
 LAN_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
 if [ -n "$LAN_IP" ] && [ "${LAN_IP#127.}" = "$LAN_IP" ]; then
-  printf '$ curl --connect-timeout 2 http://%s:18930/-/health\n' "$LAN_IP"
-  if curl -sS --connect-timeout 2 "http://$LAN_IP:18930/-/health" >/dev/null 2>&1; then
+  printf '$ curl --connect-timeout 2 http://%s:%s/-/health\n' "$LAN_IP" "$GW_PORT"
+  if curl -sS --connect-timeout 2 "http://$LAN_IP:${GW_PORT}/-/health" >/dev/null 2>&1; then
     check_eq "12.3 非回环地址不可达" "unreachable" "reachable"
   else
     check_eq "12.3 非回环地址不可达" "unreachable" "unreachable"
@@ -403,12 +406,12 @@ curl -sS -o /dev/null -D "$TMP/v1.hdr" -H "Host: $HOST_V2" "http://$GW_ADDR/_aut
 V_AUTH="$(header_value "$TMP/v1.hdr" Location)"
 curl -sS -o /dev/null -D "$TMP/v2.hdr" "$V_AUTH"
 V_CB="$(header_value "$TMP/v2.hdr" Location)"
-curl -sS --resolve "v2.example.com:18930:127.0.0.1" -o /dev/null -D "$TMP/v3.hdr" "$V_CB"
+curl -sS --resolve "v2.example.com:${GW_PORT}:127.0.0.1" -o /dev/null -D "$TMP/v3.hdr" "$V_CB"
 SID_V2="$(cookie_header "$TMP/v3.hdr" | sed -n 's/.*__Host-appv2_session=\([^;]*\).*/\1/p')"
 echo "logged in v2: sid=${SID_V2:0:8}... status=$(status_of "$TMP/v3.hdr")"
 
 printf '$ curl -sS -H %s -H %s -H %s http://%s/api/data\n' \
-  "'Host: v2.example.com:18930'" "'Cookie: __Host-appv2_session=<sid>'" \
+  "'Host: v2.example.com:${GW_PORT}'" "'Cookie: __Host-appv2_session=<sid>'" \
   "'Accept: application/json'" "$GW_ADDR"
 curl -sS -o "$TMP/c13.body" -H "Host: $HOST_V2" -H "Cookie: __Host-appv2_session=$SID_V2" \
   -H 'Accept: application/json' "http://$GW_ADDR/api/data"
@@ -440,7 +443,7 @@ check_contains "14.2 报错指向 token 密钥" "token encryption key" "$BAD_OUT
 
 title "15) 按路径分流：最长前缀、required/none 差异、伪造头剥离、WS、先登录后可用"
 
-printf '$ curl -sS -o /dev/null -D - -H %s http://%s/api/xyz\n' "'Host: r.example.com:18930'" "$GW_ADDR"
+printf '$ curl -sS -o /dev/null -D - -H %s http://%s/api/xyz\n' "'Host: r.example.com:${GW_PORT}'" "$GW_ADDR"
 curl -sS -o /dev/null -D "$TMP/r1.hdr" -H "Host: $HOST_R" "http://$GW_ADDR/api/xyz"
 cat "$TMP/r1.hdr"
 check_eq "15.1 最长前缀命中 required：未登录导航 302" "302" "$(status_of "$TMP/r1.hdr")"
@@ -473,7 +476,7 @@ check_eq "15.12 none 页面可主动登录：302" "302" "$(status_of "$TMP/r6.hd
 check_contains "15.13 登录跳 SSO authorize" "/authorize?" "$R_AUTH"
 curl -sS -o /dev/null -D "$TMP/r7.hdr" "$R_AUTH"
 R_CB="$(header_value "$TMP/r7.hdr" Location)"
-curl -sS --resolve "r.example.com:18930:127.0.0.1" -o /dev/null -D "$TMP/r8.hdr" "$R_CB"
+curl -sS --resolve "r.example.com:${GW_PORT}:127.0.0.1" -o /dev/null -D "$TMP/r8.hdr" "$R_CB"
 SID_R="$(cookie_header "$TMP/r8.hdr" | sed -n 's/.*__Host-appr_session=\([^;]*\).*/\1/p')"
 echo "logged in appr: sid=${SID_R:0:8}... status=$(status_of "$TMP/r8.hdr")"
 check_contains "15.14 登录成功下发网关 cookie" "__Host-appr_session=" "$(cookie_header "$TMP/r8.hdr")"
@@ -504,7 +507,7 @@ title "16) 启动校验：routes 配置不合法必须报错退出（不静默�
 
 mk_bad_config() { # file, routes-body
   cat > "$1" <<EOF
-listen: 127.0.0.1:18940
+listen: 127.0.0.1:${BAD_PORT}
 issuer: http://${SSO_ADDR}
 redis:
   addr: 127.0.0.1:6379
@@ -556,7 +559,7 @@ mint_token() { # query-string
 TOK_APPA="$(mint_token 'sub=mock-user-1&aud=appa&exp_in=3600')"
 SD="$(curl -sS -o "$TMP/b_sd.body" -D "$TMP/b_sd.hdr" -w '%{http_code}' -H "Host: $HOST_A" \
   -H "Authorization: Bearer $TOK_APPA" -H 'Accept: application/json' "http://$GW_ADDR/api/data")"
-printf '$ curl -sS -H %s -H %s http://%s/api/data\n' "'Host: a.example.com:18930'" \
+printf '$ curl -sS -H %s -H %s http://%s/api/data\n' "'Host: a.example.com:${GW_PORT}'" \
   "'Authorization: Bearer <valid, aud=appa>'" "$GW_ADDR"
 echo "safe-default appa: status=$SD body=$(cat "$TMP/b_sd.body")"
 check_eq "17.1 accept_bearer 默认关：合法 Bearer 仍 401" "401" "$SD"
@@ -621,7 +624,7 @@ curl -sS -o /dev/null -D "$TMP/b1.hdr" -H "Host: $HOST_BEAR" "http://$GW_ADDR/_a
 BB_AUTH="$(header_value "$TMP/b1.hdr" Location)"
 curl -sS -o /dev/null -D "$TMP/b2.hdr" "$BB_AUTH"
 BB_CB="$(header_value "$TMP/b2.hdr" Location)"
-curl -sS --resolve "bear.example.com:18930:127.0.0.1" -o /dev/null -D "$TMP/b3.hdr" "$BB_CB"
+curl -sS --resolve "bear.example.com:${GW_PORT}:127.0.0.1" -o /dev/null -D "$TMP/b3.hdr" "$BB_CB"
 SID_BEAR="$(cookie_header "$TMP/b3.hdr" | sed -n 's/.*__Host-appbear_session=\([^;]*\).*/\1/p')"
 echo "logged in appbear: sid=${SID_BEAR:0:8}..."
 TOK_OTHER="$(mint_token 'sub=app-bearer-user&aud=admin&exp_in=3600')"
@@ -652,6 +655,121 @@ V2B="$(curl -sS -o /dev/null -w '%{http_code}' -H "Host: $HOST_V2" \
   -H "Authorization: Bearer $TOK_V2" -H 'Accept: application/json' "http://$GW_ADDR/api/data")"
 echo "proxy-mode app with bearer: status=$V2B"
 check_eq "17.22 mode:proxy 未开 accept_bearer：Bearer 仍 401" "401" "$V2B"
+
+# ── 18. logout: revoke access+refresh, /end_session SSO, fallbacks, host injection ──
+
+title "18) 登出联动：撤销 access/refresh + 跳 /end_session + 无会话/失败兜底 + Host 注入"
+
+rev_count() { printf '%s' "$1" | grep -o '"count":[0-9]*' | head -1 | sed 's/"count"://'; }
+rev_arr()   { printf '%s' "$1" | grep -o "\"$2\":\[[^]]*\]" | head -1 | sed 's/^[^[]*\[//; s/\]$//; s/"//g'; }
+
+# Build a protect-app (appa) session that carries tokens: log in through the
+# proxy app (appv2) to get encrypted access/refresh tokens, rewrite the app
+# field, and store the record under a fresh sid. This exercises "protect mode
+# still revokes when tokens are present" without weakening protect mode.
+inject_appa_session() { # suffix -> prints sid
+  local suffix="$1"
+  curl -sS -o /dev/null -D "$TMP/inj1.hdr" -H "Host: $HOST_V2" "http://$GW_ADDR/_auth/login?next=%2Finj"
+  local auth; auth="$(header_value "$TMP/inj1.hdr" Location)"
+  curl -sS -o /dev/null -D "$TMP/inj2.hdr" "$auth"
+  local cb; cb="$(header_value "$TMP/inj2.hdr" Location)"
+  curl -sS --resolve "v2.example.com:${GW_PORT}:127.0.0.1" -o /dev/null -D "$TMP/inj3.hdr" "$cb"
+  local sid raw inj_json
+  sid="$(cookie_header "$TMP/inj3.hdr" | sed -n 's/.*__Host-appv2_session=\([^;]*\).*/\1/p')"
+  raw="$(redis-cli -n 2 GET "${PREFIX}sess:${sid}")"
+  inj_json="$(printf '%s' "$raw" | sed 's/"app":"appv2"/"app":"appa"/')"
+  redis-cli -n 2 SET "${PREFIX}sess:${suffix}" "$inj_json" EX 3600 >/dev/null
+  printf '%s' "$suffix"
+}
+
+# 18.1 protect 模式会话含令牌 → 登出撤销两次（refresh + access），client_id 正确。
+INJ_A="$(inject_appa_session "inject-appa-1")"
+note "injected appa session sid=${INJ_A:0:12}... (tokens present)"
+curl -sS "http://$SSO_ADDR/-/reset-revokes" >/dev/null
+curl -sS -o /dev/null -D "$TMP/l1.hdr" -H "Host: $HOST_A" \
+  -H "Cookie: __Host-appa_session=$INJ_A" "http://$GW_ADDR/_auth/logout"
+cat "$TMP/l1.hdr"
+REV="$(curl -sS "http://$SSO_ADDR/-/revokes")"
+echo "mock revokes: $REV"
+check_eq "18.1 登出响应 302" "302" "$(status_of "$TMP/l1.hdr")"
+check_contains "18.2 清 appa cookie" "__Host-appa_session=" "$(cookie_header "$TMP/l1.hdr")"
+check_contains "18.3 清 cookie Max-Age=0" "Max-Age=0" "$(cookie_header "$TMP/l1.hdr")"
+check_eq "18.4 mock 收到两次 /revoke" "2" "$(rev_count "$REV")"
+check_eq "18.5 两次 client_id 均为 appa" "appa,appa" "$(rev_arr "$REV" client_ids)"
+check_contains "18.6 撤销了 refresh token" "refresh" "$(rev_arr "$REV" kinds)"
+check_contains "18.7 撤销了 access token" "access" "$(rev_arr "$REV" kinds)"
+
+# 18.8 Location 指向 mock issuer 的 /end_session，参数正确（client_id + 本站绝对回跳）。
+LOC1="$(header_value "$TMP/l1.hdr" Location)"
+echo "logout Location: $LOC1"
+check_contains "18.8 Location 指向 mock issuer /end_session" "http://$SSO_ADDR/end_session?" "$LOC1"
+check_contains "18.9 client_id=appa" "client_id=appa" "$LOC1"
+check_contains "18.10 post_logout_redirect_uri=本站绝对地址" \
+  "post_logout_redirect_uri=https%3A%2F%2Fa.example.com%2F" "$LOC1"
+
+# 18.11 跟随 /end_session：认证中心清 SSO cookie 并 302 回站点。
+curl -sS -o /dev/null -D "$TMP/l1e.hdr" "$LOC1"
+cat "$TMP/l1e.hdr"
+check_eq "18.11 end_session 302 回站点" "302" "$(status_of "$TMP/l1e.hdr")"
+check_eq "18.12 回跳到本站绝对地址" "https://a.example.com/" "$(header_value "$TMP/l1e.hdr" Location)"
+check_contains "18.13 end_session 清 SSO cookie" "mock_sso=" "$(cookie_header "$TMP/l1e.hdr")"
+check_contains "18.14 SSO cookie Max-Age=0" "Max-Age=0" "$(cookie_header "$TMP/l1e.hdr")"
+
+# 18.15 登出后本地会话已删（原 cookie 失效 401）。
+AFTER1="$(curl -sS -o /dev/null -w '%{http_code}' -H "Host: $HOST_A" \
+  -H "Cookie: __Host-appa_session=$INJ_A" -H 'Accept: application/json' "http://$GW_ADDR/api/me")"
+echo "appa after logout: status=$AFTER1"
+check_eq "18.15 登出后本地会话已删 401" "401" "$AFTER1"
+
+# 18.16 无会话（无 cookie）登出 → 仍 302 到 /end_session。
+curl -sS -o /dev/null -D "$TMP/l2.hdr" -H "Host: $HOST_A" "http://$GW_ADDR/_auth/logout"
+cat "$TMP/l2.hdr"
+LOC2="$(header_value "$TMP/l2.hdr" Location)"
+check_eq "18.16 无会话登出 302" "302" "$(status_of "$TMP/l2.hdr")"
+check_contains "18.17 无会话仍跳 /end_session" "http://$SSO_ADDR/end_session?client_id=appa" "$LOC2"
+
+# 18.18 issuer 对 /revoke 返回 500 → 登出完成、回退本地 LogoutRedirect。
+INJ_B="$(inject_appa_session "inject-appa-2")"
+curl -sS "http://$SSO_ADDR/-/revoke-mode?status=500" >/dev/null
+curl -sS --max-time 10 -o /dev/null -D "$TMP/l3.hdr" -H "Host: $HOST_A" \
+  -H "Cookie: __Host-appa_session=$INJ_B" "http://$GW_ADDR/_auth/logout"
+curl -sS "http://$SSO_ADDR/-/revoke-mode?status=0" >/dev/null
+cat "$TMP/l3.hdr"
+check_eq "18.18 revoke 500 时登出 302" "302" "$(status_of "$TMP/l3.hdr")"
+check_eq "18.19 回退本地 LogoutRedirect" "/" "$(header_value "$TMP/l3.hdr" Location)"
+check_contains "18.20 仍清 cookie" "Max-Age=0" "$(cookie_header "$TMP/l3.hdr")"
+AFTER2="$(curl -sS -o /dev/null -w '%{http_code}' -H "Host: $HOST_A" \
+  -H "Cookie: __Host-appa_session=$INJ_B" -H 'Accept: application/json' "http://$GW_ADDR/api/me")"
+check_eq "18.21 本地会话已删 401" "401" "$AFTER2"
+
+# 18.22 issuer /revoke 连接被断（不可达）→ 同样回退本地、不 500、不挂起。
+INJ_C="$(inject_appa_session "inject-appa-3")"
+curl -sS "http://$SSO_ADDR/-/revoke-mode?close=1" >/dev/null
+L4TIME="$(curl -sS --max-time 10 -o /dev/null -D "$TMP/l4.hdr" -w '%{time_total}' -H "Host: $HOST_A" \
+  -H "Cookie: __Host-appa_session=$INJ_C" "http://$GW_ADDR/_auth/logout")"
+curl -sS "http://$SSO_ADDR/-/revoke-mode?close=0" >/dev/null
+cat "$TMP/l4.hdr"
+echo "unreachable-issuer logout time=${L4TIME}s"
+check_eq "18.22 issuer 不可达时登出 302" "302" "$(status_of "$TMP/l4.hdr")"
+check_eq "18.23 回退本地 LogoutRedirect" "/" "$(header_value "$TMP/l4.hdr" Location)"
+
+# 18.24 Host / X-Forwarded-Host 注入：回跳地址绝不反射请求头里的 host。
+#  (a) 伪造 X-Forwarded-Host 但 Host 合法 → 解析不到配置内 app → 404。
+curl -sS -o "$TMP/h1.body" -D "$TMP/h1.hdr" -H "Host: $HOST_A" \
+  -H 'X-Forwarded-Host: evil.example' "http://$GW_ADDR/_auth/logout"
+H1OUT="$(cat "$TMP/h1.hdr"; cat "$TMP/h1.body")"
+check_eq "18.24 伪造 X-Forwarded-Host → 404" "404" "$(status_of "$TMP/h1.hdr")"
+check_not_contains "18.25 响应不含 evil.example" "evil.example" "$H1OUT"
+#  (b) Host 伪造、X-Forwarded-Host 命中配置 → app 命中，但回跳用配置 host。
+curl -sS -o /dev/null -D "$TMP/h2.hdr" -H 'Host: evil.example' \
+  -H "X-Forwarded-Host: a.example.com" "http://$GW_ADDR/_auth/logout"
+LOC_H2="$(header_value "$TMP/h2.hdr" Location)"
+echo "host-injection Location: $LOC_H2"
+check_contains "18.26 回跳用配置 host" "post_logout_redirect_uri=https%3A%2F%2Fa.example.com%2F" "$LOC_H2"
+check_not_contains "18.27 回跳不含 evil.example" "evil.example" "$LOC_H2"
+#  (c) Host 伪造且无 X-Forwarded-Host → 无配置 app → 404。
+curl -sS -o /dev/null -D "$TMP/h3.hdr" -H 'Host: evil.example' "http://$GW_ADDR/_auth/logout"
+check_eq "18.28 伪造 Host → 404" "404" "$(status_of "$TMP/h3.hdr")"
 
 # ── summary ──────────────────────────────────────────────────────────────
 
