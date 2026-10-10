@@ -46,6 +46,12 @@ cp config.example.yaml config.yaml   # 按部署环境填写
 - Redis：DB 默认 2，键带 `gw:` 前缀；`state` 一次性消费 TTL 10 分钟；会话 7 天滑动。
 - Token：AES-256-GCM 加密后存 Redis，密钥读自 `token.encryption_key_file`（部署时按 0600 放置）。
 - 审计：`audit.file` 为必填，追加写入登录 / 登出 / 拒绝 / 刷新事件，不记 token 与 cookie 值。
+- 登出：清本地会话 cookie 与 Redis 记录，并对会话里存在的 refresh / access token 各做一次
+  best-effort 撤销（与 `mode` 无关，3s 短超时）；随后 302 到认证中心 `<issuer>/end_session`，
+  由浏览器带着认证中心 cookie 去结束 SSO 会话（`client_id` + 由配置 `hosts[0]` 拼出的绝对
+  `post_logout_redirect_uri`，绝不反射请求里的 Host）。认证中心不可达 / 拒绝，或无法从配置拼出
+  回跳地址时，回退本地 `logout_redirect`；登出永不卡死、不 500、不白屏。
+  回跳 scheme 默认 `https`，仅本地开发可用 app 级 `scheme: http` 覆盖。
 
 ## 两条身份通道：网页 cookie / 原生 APP Bearer
 
@@ -66,7 +72,8 @@ cp config.example.yaml config.yaml   # 按部署环境填写
 ## 离线自测
 
 `test/selftest.sh` 在回环地址上用私有端口 18930/18931/18932 与 Redis DB 2
-（前缀 `gw:selftest:`）跑完全部验收，不需要真实 SSO：
+（前缀 `gw:selftest:`）跑完全部验收，不需要真实 SSO；端口可用
+`SELFTEST_GW_ADDR` / `SELFTEST_SSO_ADDR` / `SELFTEST_UP_ADDR` / `SELFTEST_BAD_PORT` 覆盖：
 
 ```sh
 bash test/selftest.sh

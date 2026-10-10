@@ -41,6 +41,7 @@ See `config.example.yaml` for examples of the remaining keys (`session`, `token`
 - Redis: DB defaults to 2 with keys prefixed `gw:`; `state` is consumed once with a 10-minute TTL; sessions slide for 7 days.
 - Token: encrypted with AES-256-GCM and stored in Redis; the key is read from `token.encryption_key_file` (placed with 0600 at deployment).
 - Audit: `audit.file` is required; login / logout / denial / refresh events are appended, without recording token or cookie values.
+- Logout: clears the local session cookie and Redis record, then best-effort revokes each refresh / access token present in the session (independent of `mode`, with a 3s cap); it then 302s to the auth centre's `<issuer>/end_session` so the browser ends the SSO session (`client_id` plus an absolute `post_logout_redirect_uri` built from the configured `hosts[0]`, never reflected from the request Host). If the auth centre is unreachable / refusing, or no return URL can be built from configuration, it falls back to the local `logout_redirect`; logout never hangs, never 500s and never shows a blank page. The return scheme defaults to `https`; local development may override it with an app-level `scheme: http`.
 
 ## Two identity channels: web cookie / native APP Bearer
 
@@ -57,7 +58,7 @@ The same protected route supports both callers, and both map identity to the sam
 
 ## Offline self-test
 
-`test/selftest.sh` runs the full acceptance on loopback with private ports 18930/18931/18932 and Redis DB 2 (prefix `gw:selftest:`), without real SSO:
+`test/selftest.sh` runs the full acceptance on loopback with private ports 18930/18931/18932 and Redis DB 2 (prefix `gw:selftest:`), without real SSO; the ports can be overridden with `SELFTEST_GW_ADDR` / `SELFTEST_SSO_ADDR` / `SELFTEST_UP_ADDR` / `SELFTEST_BAD_PORT`:
 
 ```sh
 bash test/selftest.sh

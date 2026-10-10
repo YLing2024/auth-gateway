@@ -33,6 +33,8 @@ apps:
     upstream: http://127.0.0.1:8000
     mode: protect
     secret_file: /etc/auth-gateway/android.secret
+    # 登出回跳用的站点 scheme，默认 https；仅本地开发可设为 http（须显式配置）。
+    # scheme: http
     # 原生 APP/CLI 通道：额外接受客户端 Authorization: Bearer <access_token>。
     # 默认 false（不写这两项时行为与旧版逐字节一致，受保护请求只认会话 cookie）。
     # 本地 JWKS 验 ES256 签名并校验 iss/aud/exp/nbf/jti 撤销；失败一律 401 JSON，
