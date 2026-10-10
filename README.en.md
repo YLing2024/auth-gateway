@@ -33,7 +33,7 @@ See `config.example.yaml` for examples of the remaining keys (`session`, `token`
 
 ## Key behaviors
 
-- Routes: `/-/health`, `/_auth/{login,callback,logout,me}`; `/_auth/*` precedes the session check.
+- Routes: `/-/health`, `/_auth/{login,callback,logout,me}`, `/_auth/backchannel-logout`; `/_auth/*` precedes the session check.
 - Path dispatch (optional `routes`): one app can declare multiple `prefix` entries, longest prefix first (ties in written order); `auth: required` keeps the whole-site auth behavior, and `auth: none` is a public path (no session created, no identity header injected, but client-forged identity headers and gateway cookies are still stripped); no matching prefix returns 404. An app without `routes` behaves unchanged.
 - Session cookie: `__Host-<app>_session`, `HttpOnly; Secure; SameSite=Lax; Path=/`, no Domain.
 - Not logged in: navigation requests are 302'd to `/_auth/login?next=…`; API requests (JSON/XHR/cors) receive a 401 JSON and the cookie is cleared.
@@ -41,7 +41,8 @@ See `config.example.yaml` for examples of the remaining keys (`session`, `token`
 - Redis: DB defaults to 2 with keys prefixed `gw:`; `state` is consumed once with a 10-minute TTL; sessions slide for 7 days.
 - Token: encrypted with AES-256-GCM and stored in Redis; the key is read from `token.encryption_key_file` (placed with 0600 at deployment).
 - Audit: `audit.file` is required; login / logout / denial / refresh events are appended, without recording token or cookie values.
-- Logout: clears the local session cookie and Redis record, then best-effort revokes each refresh / access token present in the session (independent of `mode`, with a 3s cap); it then 302s to the auth centre's `<issuer>/end_session` so the browser ends the SSO session (`client_id` plus an absolute `post_logout_redirect_uri` built from the configured `hosts[0]`, never reflected from the request Host). If the auth centre is unreachable / refusing, or no return URL can be built from configuration, it falls back to the local `logout_redirect`; logout never hangs, never 500s and never shows a blank page. The return scheme defaults to `https`; local development may override it with an app-level `scheme: http`.
+- Logout: clears the local session cookie and Redis record, then best-effort revokes each refresh / access token present in the session (independent of `mode`, with a 3s cap); it then 302s to the auth centre's `<issuer>/end_session` so the browser ends the SSO session (`client_id` plus an absolute `post_logout_redirect_uri` built from the configured `hosts[0]`, never reflected from the request Host). Before redirecting it probes the issuer's discovery endpoint for at most 2s: if unreachable it falls back to the local `logout_redirect` instead of showing the user an error page. It also falls back locally when the auth centre refuses or no return URL can be built from configuration; logout never hangs, never 500s and never shows a blank page. The return scheme defaults to `https`; local development may override it with an app-level `scheme: http`.
+- Global logout (log out once → leave every site): each session record carries the id_token `sid` and is indexed by `gw:sid:<sid>`. After `/end_session` the auth centre asynchronously calls back `POST /_auth/backchannel-logout` (authenticated by loopback + `X-Internal-Token`, both required); the gateway then deletes every session under that sid across all apps, so cookies stop resolving and TOTP login is required again. Unknown sid returns 204 (idempotent), a missing sid / bad body returns 400, and failed auth returns a bare 401. Config: `backchannel.internal_token_file` (the same file the auth centre uses) and `backchannel.enabled` (default true; false makes the endpoint return 404 for grey release / rollback). The endpoint adds no per-request cost: session validation stays local signature check + local read.
 
 ## Two identity channels: web cookie / native APP Bearer
 
@@ -58,7 +59,7 @@ The same protected route supports both callers, and both map identity to the sam
 
 ## Offline self-test
 
-`test/selftest.sh` runs the full acceptance on loopback with private ports 18930/18931/18932 and Redis DB 2 (prefix `gw:selftest:`), without real SSO; the ports can be overridden with `SELFTEST_GW_ADDR` / `SELFTEST_SSO_ADDR` / `SELFTEST_UP_ADDR` / `SELFTEST_BAD_PORT`:
+`test/selftest.sh` runs the full acceptance on loopback with private ports 18930/18931/18932 and Redis DB 2 (prefix `gw:selftest:`), without real SSO; the ports can be overridden with `SELFTEST_GW_ADDR` / `SELFTEST_SSO_ADDR` / `SELFTEST_UP_ADDR` / `SELFTEST_BAD_PORT` / `SELFTEST_BC_ADDR`:
 
 ```sh
 bash test/selftest.sh

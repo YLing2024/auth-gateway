@@ -35,7 +35,7 @@ cp config.example.yaml config.yaml   # 按部署环境填写
 
 ## 关键行为
 
-- 路由：`/-/health`、`/_auth/{login,callback,logout,me}`；`/_auth/*` 先于会话检查。
+- 路由：`/-/health`、`/_auth/{login,callback,logout,me}`、`/_auth/backchannel-logout`；`/_auth/*` 先于会话检查。
 - 按路径分流（可选 `routes`）：一个 app 可声明多条 `prefix`，最长前缀优先（等长按书写顺序）；
   `auth: required` 沿用整站鉴权行为，`auth: none` 为公开路径（不建会话、不注入身份头，但仍剥掉
   客户端伪造的身份头和网关 cookie）；未命中任何 prefix 返回 404。无 `routes` 的 app 行为不变。
@@ -49,9 +49,17 @@ cp config.example.yaml config.yaml   # 按部署环境填写
 - 登出：清本地会话 cookie 与 Redis 记录，并对会话里存在的 refresh / access token 各做一次
   best-effort 撤销（与 `mode` 无关，3s 短超时）；随后 302 到认证中心 `<issuer>/end_session`，
   由浏览器带着认证中心 cookie 去结束 SSO 会话（`client_id` + 由配置 `hosts[0]` 拼出的绝对
-  `post_logout_redirect_uri`，绝不反射请求里的 Host）。认证中心不可达 / 拒绝，或无法从配置拼出
-  回跳地址时，回退本地 `logout_redirect`；登出永不卡死、不 500、不白屏。
-  回跳 scheme 默认 `https`，仅本地开发可用 app 级 `scheme: http` 覆盖。
+  `post_logout_redirect_uri`，绝不反射请求里的 Host）。跳转前先对 issuer 的 discovery 做一次
+  ≤2s 可达性探活：不可达则回退本地 `logout_redirect`，不把用户丢到错误页。认证中心拒绝、或无法从
+  配置拼出回跳地址时同样回退本地；登出永不卡死、不 500、不白屏。回跳 scheme 默认 `https`，仅本地
+  开发可用 app 级 `scheme: http` 覆盖。
+- 全局登出（一处登出 → 全部站点退出）：会话记录携带 id_token 的 `sid`，并按 `gw:sid:<sid>` 反向
+  索引全部会话。认证中心在 `/end_session` 完成后异步回调 `POST /_auth/backchannel-logout`
+  （loopback + `X-Internal-Token` 双条件鉴权），网关据此删除该 sid 下所有 app 的会话，cookie 自然
+  失效、必须重新走 TOTP 登录。未知 sid 返回 204（幂等），缺 sid / 非法体 400，鉴权失败 401 不解释
+  原因。配置见 `backchannel.internal_token_file`（与认证中心同一文件）与 `backchannel.enabled`
+  （缺省 true；false 时端点 404，用于灰度 / 回退）。该端点不新增任何每请求开销：会话校验仍是本地
+  验签 + 本地读。
 
 ## 两条身份通道：网页 cookie / 原生 APP Bearer
 
@@ -73,7 +81,8 @@ cp config.example.yaml config.yaml   # 按部署环境填写
 
 `test/selftest.sh` 在回环地址上用私有端口 18930/18931/18932 与 Redis DB 2
 （前缀 `gw:selftest:`）跑完全部验收，不需要真实 SSO；端口可用
-`SELFTEST_GW_ADDR` / `SELFTEST_SSO_ADDR` / `SELFTEST_UP_ADDR` / `SELFTEST_BAD_PORT` 覆盖：
+`SELFTEST_GW_ADDR` / `SELFTEST_SSO_ADDR` / `SELFTEST_UP_ADDR` / `SELFTEST_BAD_PORT` /
+`SELFTEST_BC_ADDR` 覆盖：
 
 ```sh
 bash test/selftest.sh

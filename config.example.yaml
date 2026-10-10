@@ -25,6 +25,13 @@ audit:
   file: /data/authgw/audit.log   # 不记 token / cookie 值
   retention_days: 30
 
+# 全局登出 back-channel：认证中心在 /end_session 完成后回调本端点，让该 sid 下的
+# 网关会话全部失效（一处登出 → 全部站点退出）。internal_token_file 与认证中心共用
+# （默认 <DATA_DIR>/internal-token，0600）；enabled 缺省 true，设为 false 时端点返回 404。
+backchannel:
+  internal_token_file: /data/auth-server/internal-token
+  enabled: true
+
 # ── 站点清单（白名单：转发目标只能来自这里，绝不接受请求里的 URL）──
 apps:
   # protect：只做登录 + 会话 + 放行静态/上游，不保存 token（泄漏面最小）
