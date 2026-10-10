@@ -1,7 +1,7 @@
 // Command mocksso is an offline stand-in for the SSO issuer used by the
 // gateway self-test. It implements just enough of the OIDC flow: a JWKS with an
-// ephemeral ES256 key, /authorize, /token (PKCE + client_secret validation) and
-// /revoke. It must never be deployed.
+// ephemeral ES256 key, /authorize, /token (PKCE + client_secret validation),
+// /revoke and /end_session. It must never be deployed.
 package main
 
 import (
@@ -40,6 +40,19 @@ type server struct {
 	mu     sync.Mutex
 	codes  map[string]pending
 	logger *log.Logger
+
+	// Self-test controls for /revoke. They exist only so the gateway's logout
+	// fallback can be exercised offline; never used in production.
+	revokeStatus int
+	revokeClose  bool
+	revokes      []revokeRec
+}
+
+// revokeRec records one /revoke call. Only the client id and the token class
+// ("access" / "refresh" / "other") are kept; token values are never stored.
+type revokeRec struct {
+	ClientID string `json:"client_id"`
+	Kind     string `json:"kind"`
 }
 
 func main() {
@@ -73,7 +86,11 @@ func main() {
 	mux.HandleFunc("/authorize", s.handleAuthorize)
 	mux.HandleFunc("/token", s.handleToken)
 	mux.HandleFunc("/revoke", s.handleRevoke)
+	mux.HandleFunc("/end_session", s.handleEndSession)
 	mux.HandleFunc("/test/mint", s.handleMint) // self-test only: mint arbitrary JWTs
+	mux.HandleFunc("/-/revokes", s.handleRevokes)
+	mux.HandleFunc("/-/reset-revokes", s.handleResetRevokes)
+	mux.HandleFunc("/-/revoke-mode", s.handleRevokeMode)
 	mux.HandleFunc("/-/health", func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, "ok") })
 
 	s.logger.Printf("listening on %s (issuer %s)", *addr, s.issuer)
@@ -176,8 +193,104 @@ func (s *server) handleToken(w http.ResponseWriter, r *http.Request) {
 
 func (s *server) handleRevoke(w http.ResponseWriter, r *http.Request) {
 	_ = r.ParseForm()
+
+	s.mu.Lock()
+	status, closeConn := s.revokeStatus, s.revokeClose
+	s.mu.Unlock()
+
+	if closeConn {
+		// Simulate an unreachable issuer: drop the connection mid-request.
+		if hj, ok := w.(http.Hijacker); ok {
+			if conn, _, err := hj.Hijack(); err == nil {
+				_ = conn.Close()
+				return
+			}
+		}
+		http.Error(w, "closed", http.StatusInternalServerError)
+		return
+	}
+	if status >= 400 {
+		http.Error(w, "forced revoke failure", status)
+		return
+	}
+
+	s.recordRevoke(r.PostFormValue("client_id"), r.PostFormValue("token"))
 	w.Header().Set("Content-Type", "application/json")
 	fmt.Fprint(w, `{"revoked":true}`)
+}
+
+// recordRevoke keeps the client id and the token class, never the token value.
+func (s *server) recordRevoke(clientID, token string) {
+	kind := "other"
+	switch {
+	case strings.HasPrefix(token, "at-"):
+		kind = "access"
+	case strings.HasPrefix(token, "rt-"):
+		kind = "refresh"
+	}
+	s.mu.Lock()
+	s.revokes = append(s.revokes, revokeRec{ClientID: clientID, Kind: kind})
+	s.mu.Unlock()
+}
+
+// handleRevokes reports the recorded /revoke calls for the self-test.
+func (s *server) handleRevokes(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	recs := append([]revokeRec(nil), s.revokes...)
+	s.mu.Unlock()
+	clientIDs := make([]string, 0, len(recs))
+	kinds := make([]string, 0, len(recs))
+	for _, rec := range recs {
+		clientIDs = append(clientIDs, rec.ClientID)
+		kinds = append(kinds, rec.Kind)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"count": len(recs), "client_ids": clientIDs, "kinds": kinds,
+	})
+}
+
+func (s *server) handleResetRevokes(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	s.revokes = nil
+	s.mu.Unlock()
+	fmt.Fprint(w, "ok")
+}
+
+// handleRevokeMode sets the /revoke failure behaviour: ?status=NNN forces an
+// HTTP error, ?close=1 drops the connection (unreachable issuer).
+func (s *server) handleRevokeMode(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	s.mu.Lock()
+	if v := q.Get("status"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			s.revokeStatus = n
+		}
+	}
+	if v := q.Get("close"); v != "" {
+		s.revokeClose = v == "1" || v == "true"
+	}
+	status, closeConn := s.revokeStatus, s.revokeClose
+	s.mu.Unlock()
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"status": status, "close": closeConn})
+}
+
+// handleEndSession is a minimal RP-initiated logout stub: it clears its
+// host-only SSO cookie and bounces back to post_logout_redirect_uri when given.
+func (s *server) handleEndSession(w http.ResponseWriter, r *http.Request) {
+	_ = r.ParseForm()
+	http.SetCookie(w, &http.Cookie{Name: "mock_sso", Value: "", Path: "/", MaxAge: -1})
+	postLogout := r.URL.Query().Get("post_logout_redirect_uri")
+	if postLogout == "" {
+		postLogout = r.PostFormValue("post_logout_redirect_uri")
+	}
+	if postLogout != "" {
+		http.Redirect(w, r, postLogout, http.StatusFound)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	fmt.Fprint(w, "logged out")
 }
 
 func (s *server) signIDToken(claims map[string]any) (string, error) {
