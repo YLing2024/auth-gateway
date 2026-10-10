@@ -75,6 +75,20 @@ func (p *Provider) AuthorizeURL(clientID, redirectURI, state, challenge string) 
 	return p.Issuer + "/authorize?" + q.Encode()
 }
 
+// EndSessionURL builds the RP-initiated logout redirect to the issuer's
+// /end_session endpoint. postLogoutRedirectURI must be an absolute URL from
+// trusted configuration; it is omitted when empty. No id_token_hint is sent:
+// the issuer resolves the client from client_id and every deployed client uses
+// a host-only SSO cookie (cookie_domain unset).
+func (p *Provider) EndSessionURL(clientID, postLogoutRedirectURI string) string {
+	q := url.Values{}
+	q.Set("client_id", clientID)
+	if postLogoutRedirectURI != "" {
+		q.Set("post_logout_redirect_uri", postLogoutRedirectURI)
+	}
+	return p.Issuer + "/end_session?" + q.Encode()
+}
+
 // ExchangeCode performs the authorization_code + PKCE token exchange using
 // client_secret_post. It validates the PKCE relationship locally too.
 func (p *Provider) ExchangeCode(ctx context.Context, clientID, clientSecret, code, redirectURI, verifier string) (*TokenResponse, error) {
