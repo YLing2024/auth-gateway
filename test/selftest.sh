@@ -895,6 +895,13 @@ cat "$TMP/p3.hdr"
 check_eq "19.18 enabled=false 时单站登出仍 302" "302" "$(status_of "$TMP/p3.hdr")"
 check_contains "19.19 enabled=false 时仍跳 /end_session" "/end_session?" "$(header_value "$TMP/p3.hdr" Location)"
 
+# 19.20/19.21 兜底：{"sub":..,"all":true} 删除该用户全部会话
+ALL_SID="$(login_app "$HOST_A" __Host-appa_session g_all)"
+BC_ALL="$(bc_post '{"sub":"mock-user-1","all":true}')"
+echo "all:true fallback: $BC_ALL"
+check_eq "19.20 all:true 兜底 → 204" "204" "$BC_ALL"
+check_eq "19.21 兜底后会话已删 401" "401" "$(me_status "$HOST_A" __Host-appa_session "$ALL_SID")"
+
 # ── summary ──────────────────────────────────────────────────────────────
 
 title "汇总"
