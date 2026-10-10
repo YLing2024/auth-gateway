@@ -280,6 +280,62 @@ apps:
 	})
 }
 
+func TestAppSiteURLUsesConfigOnly(t *testing.T) {
+	a := &AppConfig{ID: "appa", Hosts: []string{" a.example.com "}}
+	got, ok := a.SiteURL("/")
+	if !ok || got != "https://a.example.com/" {
+		t.Fatalf("SiteURL default = (%q, %v), want https://a.example.com/", got, ok)
+	}
+	if got, _ := a.SiteURL(""); got != "https://a.example.com/" {
+		t.Fatalf("empty path = %q, want https://a.example.com/", got)
+	}
+	if got, _ := a.SiteURL("/deep?x=1"); got != "https://a.example.com/deep?x=1" {
+		t.Fatalf("path = %q", got)
+	}
+
+	// Scheme comes from config and defaults to https; http is only used when
+	// explicitly configured (local development).
+	local := &AppConfig{ID: "appa", Hosts: []string{"localhost"}, Scheme: "http"}
+	if got, _ := local.SiteURL("/"); got != "http://localhost/" {
+		t.Fatalf("http scheme = %q", got)
+	}
+	bad := &AppConfig{ID: "appa", Hosts: []string{"a.example.com"}, Scheme: "ftp"}
+	if _, ok := bad.SiteURL("/"); ok {
+		t.Fatal("non-http(s) scheme must not build a URL")
+	}
+	// A relative path never yields a URL, and no request data is consulted.
+	noHost := &AppConfig{ID: "appa"}
+	if _, ok := noHost.SiteURL("/"); ok {
+		t.Fatal("app without hosts must not build a URL")
+	}
+	if _, ok := (&AppConfig{ID: "x", Hosts: []string{"a.example.com"}}).SiteURL("relative"); ok {
+		t.Fatal("relative path must not build a URL")
+	}
+}
+
+func TestSchemeValidation(t *testing.T) {
+	dir := t.TempDir()
+	secret := write(t, dir, "q.secret", "x")
+	bad := `
+listen: 127.0.0.1:18920
+issuer: https://auth.example.com
+redis:
+  addr: 127.0.0.1:6379
+audit:
+  file: /tmp/audit.log
+apps:
+  - id: q
+    hosts: [q.example.com]
+    upstream: http://127.0.0.1:5300
+    mode: protect
+    scheme: gopher
+    secret_file: ` + secret + `
+`
+	if _, err := loadYAML(t, bad); err == nil {
+		t.Fatal("invalid scheme must be rejected")
+	}
+}
+
 func TestRoutesDuplicatePrefixRejected(t *testing.T) {
 	dir := t.TempDir()
 	secret := write(t, dir, "q.secret", "x")

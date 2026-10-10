@@ -101,6 +101,11 @@ type AppConfig struct {
 	SecretFile  string   `yaml:"secret_file"`
 	Routes      []Route  `yaml:"routes"`
 
+	// Scheme is the public scheme used to build absolute post-logout return
+	// URLs. It must be http or https and defaults to https; http exists only
+	// for local development. Production sites are always https.
+	Scheme string `yaml:"scheme"`
+
 	// AcceptBearer makes protected requests accept a client-presented
 	// Authorization: Bearer access token (native app / CLI channel). Disabled
 	// by default so an app that omits the field behaves exactly as before.
@@ -144,6 +149,34 @@ type Route struct {
 	Prefix   string `yaml:"prefix"`
 	Upstream string `yaml:"upstream"`
 	Auth     string `yaml:"auth"` // required | none
+}
+
+// SiteURL builds an absolute URL for path on the app's first configured host
+// using the app's scheme (default https). It only ever uses configuration, so
+// it is immune to Host / X-Forwarded-Host injection and open redirects. ok is
+// false when the app has no usable host or path is not site-absolute.
+func (a *AppConfig) SiteURL(path string) (string, bool) {
+	scheme := strings.ToLower(strings.TrimSpace(a.Scheme))
+	if scheme == "" {
+		scheme = "https"
+	}
+	if scheme != "http" && scheme != "https" {
+		return "", false
+	}
+	if len(a.Hosts) == 0 {
+		return "", false
+	}
+	host := strings.ToLower(strings.TrimSpace(a.Hosts[0]))
+	if host == "" {
+		return "", false
+	}
+	if path == "" {
+		path = "/"
+	}
+	if !strings.HasPrefix(path, "/") {
+		return "", false
+	}
+	return scheme + "://" + host + path, true
 }
 
 // Load reads YAML from path, applies environment overrides and validates.
@@ -329,6 +362,14 @@ func (c *Config) normalizeAndValidate() error {
 		}
 		if strings.TrimSpace(a.SecretFile) == "" {
 			errs = append(errs, fmt.Sprintf("app %q is missing secret_file", a.ID))
+		}
+
+		if s := strings.ToLower(strings.TrimSpace(a.Scheme)); s != "" {
+			if s != "http" && s != "https" {
+				errs = append(errs, fmt.Sprintf("app %q has invalid scheme %q (want http|https)", a.ID, a.Scheme))
+			} else {
+				a.Scheme = s
+			}
 		}
 
 		// Client bearer tokens: an absent audience list defaults to [app.id];
