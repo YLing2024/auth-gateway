@@ -46,6 +46,16 @@ type server struct {
 	revokeStatus int
 	revokeClose  bool
 	revokes      []revokeRec
+
+	// Self-test controls for the discovery probe. close simulates an
+	// unreachable issuer (the gateway's logout probe must fall back locally).
+	discoveryStatus int
+	discoveryClose  bool
+
+	// sid is the value placed in the id_token "sid" claim. Empty by default so
+	// the gateway stores no sid index; the global-logout self-test sets it to
+	// make two logins share one sid.
+	sid string
 }
 
 // revokeRec records one /revoke call. Only the client id and the token class
@@ -83,6 +93,7 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/jwks.json", s.handleJWKS)
+	mux.HandleFunc("/.well-known/openid-configuration", s.handleDiscovery)
 	mux.HandleFunc("/authorize", s.handleAuthorize)
 	mux.HandleFunc("/token", s.handleToken)
 	mux.HandleFunc("/revoke", s.handleRevoke)
@@ -91,6 +102,8 @@ func main() {
 	mux.HandleFunc("/-/revokes", s.handleRevokes)
 	mux.HandleFunc("/-/reset-revokes", s.handleResetRevokes)
 	mux.HandleFunc("/-/revoke-mode", s.handleRevokeMode)
+	mux.HandleFunc("/-/discovery-mode", s.handleDiscoveryMode)
+	mux.HandleFunc("/-/sid", s.handleSid)
 	mux.HandleFunc("/-/health", func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, "ok") })
 
 	s.logger.Printf("listening on %s (issuer %s)", *addr, s.issuer)
@@ -174,10 +187,17 @@ func (s *server) handleToken(w http.ResponseWriter, r *http.Request) {
 	}
 
 	now := time.Now()
-	idToken, err := s.signIDToken(map[string]any{
+	s.mu.Lock()
+	sid := s.sid
+	s.mu.Unlock()
+	claims := map[string]any{
 		"iss": s.issuer, "sub": "mock-user-1", "aud": clientID, "name": "Mock User",
 		"iat": now.Unix(), "exp": now.Add(time.Hour).Unix(), "jti": mustRandom(8),
-	})
+	}
+	if sid != "" {
+		claims["sid"] = sid
+	}
+	idToken, err := s.signIDToken(claims)
 	if err != nil {
 		http.Error(w, "internal", http.StatusInternalServerError)
 		return
@@ -274,6 +294,64 @@ func (s *server) handleRevokeMode(w http.ResponseWriter, r *http.Request) {
 	s.mu.Unlock()
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"status": status, "close": closeConn})
+}
+
+// handleDiscovery serves a minimal discovery document so the gateway's logout
+// reachability probe sees a normal 200.
+func (s *server) handleDiscovery(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	status, closeConn := s.discoveryStatus, s.discoveryClose
+	s.mu.Unlock()
+	if closeConn {
+		if hj, ok := w.(http.Hijacker); ok {
+			if conn, _, err := hj.Hijack(); err == nil {
+				_ = conn.Close()
+				return
+			}
+		}
+		http.Error(w, "closed", http.StatusInternalServerError)
+		return
+	}
+	if status >= 400 {
+		http.Error(w, "forced discovery failure", status)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"issuer":                 s.issuer,
+		"authorization_endpoint": s.issuer + "/authorize",
+		"token_endpoint":         s.issuer + "/token",
+		"jwks_uri":               s.issuer + "/jwks.json",
+	})
+}
+
+// handleDiscoveryMode sets the discovery probe behaviour: ?close=1 drops the
+// connection (unreachable issuer), ?status=NNN forces an HTTP error.
+func (s *server) handleDiscoveryMode(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	s.mu.Lock()
+	if v := q.Get("status"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			s.discoveryStatus = n
+		}
+	}
+	if v := q.Get("close"); v != "" {
+		s.discoveryClose = v == "1" || v == "true"
+	}
+	status, closeConn := s.discoveryStatus, s.discoveryClose
+	s.mu.Unlock()
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"status": status, "close": closeConn})
+}
+
+// handleSid sets the id_token "sid" claim returned by /token. Self-test only.
+func (s *server) handleSid(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	s.sid = r.URL.Query().Get("sid")
+	cur := s.sid
+	s.mu.Unlock()
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"sid": cur})
 }
 
 // handleEndSession is a minimal RP-initiated logout stub: it clears its

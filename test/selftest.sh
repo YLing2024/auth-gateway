@@ -15,7 +15,9 @@ GW_ADDR="${SELFTEST_GW_ADDR:-127.0.0.1:18930}"
 SSO_ADDR="${SELFTEST_SSO_ADDR:-127.0.0.1:18931}"
 UP_ADDR="${SELFTEST_UP_ADDR:-127.0.0.1:18932}"
 BAD_PORT="${SELFTEST_BAD_PORT:-18940}"
+BC_ADDR="${SELFTEST_BC_ADDR:-127.0.0.1:18933}"
 GW_PORT="${GW_ADDR##*:}"
+BC_PORT="${BC_ADDR##*:}"
 HOST_A="a.example.com:${GW_PORT}"
 HOST_B="b.example.com:${GW_PORT}"
 HOST_V2="v2.example.com:${GW_PORT}"
@@ -31,9 +33,10 @@ FAILED_CASES=()
 GW_PID=""
 SSO_PID=""
 UP_PID=""
+BCGW_PID=""
 
 cleanup() {
-  for pid in "$GW_PID" "$SSO_PID" "$UP_PID"; do
+  for pid in "$GW_PID" "$SSO_PID" "$UP_PID" "$BCGW_PID"; do
     [ -n "$pid" ] && kill "$pid" 2>/dev/null
   done
   sleep 0.2
@@ -97,7 +100,8 @@ RAND_HEX="$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
 printf '%s' "$RAND_HEX" > "$TMP/token.key"
 printf '%s' "$RAND_HEX" > "$TMP/sso.secret"
 for app in appa appb appv2 appr appnr appbear; do printf '%s' "$RAND_HEX" > "$TMP/$app.secret"; done
-chmod 600 "$TMP"/*.key "$TMP"/*.secret
+printf '%s' "$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')" > "$TMP/internal-token"
+chmod 600 "$TMP"/*.key "$TMP"/*.secret "$TMP/internal-token"
 
 cat > "$TMP/config.yaml" <<EOF
 listen: ${GW_ADDR}
@@ -117,6 +121,9 @@ token:
   clock_skew_minutes: 2
 audit:
   file: ${TMP}/audit.log
+backchannel:
+  internal_token_file: ${TMP}/internal-token
+  enabled: true
 apps:
   - id: appa
     hosts: [a.example.com]
@@ -171,6 +178,10 @@ mkdir -p "$TMP/bin"
   go build -o "$TMP/bin/echoupstream" ./cmd/echoupstream && \
   go build -o "$TMP/bin/wsprobe" ./test/wsprobe ) || { echo "FATAL: build failed" >&2; exit 2; }
 note "binaries: $(ls "$TMP/bin" | tr '\n' ' ')"
+
+printf '$ go vet ./...\n'
+( cd "$ROOT" && go vet ./... ) || { echo "FATAL: go vet failed" >&2; exit 2; }
+note "go vet clean"
 
 "$TMP/bin/mocksso" -addr "$SSO_ADDR" -issuer "http://$SSO_ADDR" -secret-file "$TMP/sso.secret" >"$TMP/mocksso.log" 2>&1 &
 SSO_PID=$!
@@ -770,6 +781,119 @@ check_not_contains "18.27 回跳不含 evil.example" "evil.example" "$LOC_H2"
 #  (c) Host 伪造且无 X-Forwarded-Host → 无配置 app → 404。
 curl -sS -o /dev/null -D "$TMP/h3.hdr" -H 'Host: evil.example' "http://$GW_ADDR/_auth/logout"
 check_eq "18.28 伪造 Host → 404" "404" "$(status_of "$TMP/h3.hdr")"
+
+# ── 19. global logout back-channel + issuer probe ────────────────────────
+
+title "19) 全局登出：back-channel 端点鉴权/幂等/跨站撤销 + issuer 探活"
+
+BC_TOKEN="$(cat "$TMP/internal-token")"   # 内部令牌值绝不打印
+
+bc_post() { # body -> prints http status
+  curl -sS -o "$TMP/bc.body" -w '%{http_code}' -X POST \
+    -H "X-Internal-Token: $BC_TOKEN" -H 'Content-Type: application/json' \
+    --data "$1" "http://$GW_ADDR/_auth/backchannel-logout"
+}
+
+# 走一次完整登录，回显该 app 的会话 cookie 值
+login_app() { # hostport cookieName hdrPrefix -> prints sid
+  local hostport="$1" cookie="$2" pfx="$3" host="${1%%:*}"
+  curl -sS -o /dev/null -D "$TMP/$pfx.1" -H "Host: $hostport" "http://$GW_ADDR/_auth/login?next=%2Fhome"
+  local auth; auth="$(header_value "$TMP/$pfx.1" Location)"
+  curl -sS -o /dev/null -D "$TMP/$pfx.2" "$auth"
+  local cb; cb="$(header_value "$TMP/$pfx.2" Location)"
+  curl -sS --resolve "${host}:${GW_PORT}:127.0.0.1" -o /dev/null -D "$TMP/$pfx.3" "$cb"
+  cookie_header "$TMP/$pfx.3" | sed -n "s/.*${cookie}=\([^;]*\).*/\1/p"
+}
+
+me_status() { # hostport cookieName sid -> http status
+  curl -sS -o /dev/null -w '%{http_code}' -H "Host: $1" -H "Cookie: $2=$3" \
+    -H 'Accept: application/json' "http://$GW_ADDR/api/me"
+}
+
+# 19.1/19.2 错误 / 缺失内部令牌 → 401（不得触达会话删除逻辑）
+printf '$ curl -X POST -H %s --data %s http://%s/_auth/backchannel-logout\n' \
+  "'X-Internal-Token: <wrong>'" "'{\"sid\":\"x\"}'" "$GW_ADDR"
+BC_WRONG="$(curl -sS -o /dev/null -w '%{http_code}' -X POST -H 'X-Internal-Token: wrong-token' \
+  -H 'Content-Type: application/json' --data '{"sid":"x"}' "http://$GW_ADDR/_auth/backchannel-logout")"
+echo "wrong token: $BC_WRONG"
+check_eq "19.1 错误内部令牌 → 401" "401" "$BC_WRONG"
+BC_MISS="$(curl -sS -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' \
+  --data '{"sid":"x"}' "http://$GW_ADDR/_auth/backchannel-logout")"
+echo "missing token: $BC_MISS"
+check_eq "19.2 缺失内部令牌 → 401" "401" "$BC_MISS"
+
+# 19.3 缺 sid / 非法体 → 400
+BC_BAD="$(bc_post '{}')"
+echo "missing sid: $BC_BAD"
+check_eq "19.3 缺 sid → 400" "400" "$BC_BAD"
+
+# 19.4/19.5 未知 sid → 204（幂等），重复调用仍 204
+BC_UNK="$(bc_post '{"sid":"no-such-sid"}')"
+BC_UNK2="$(bc_post '{"sid":"no-such-sid"}')"
+echo "unknown sid: $BC_UNK then $BC_UNK2"
+check_eq "19.4 未知 sid → 204" "204" "$BC_UNK"
+check_eq "19.5 重复调用 → 204（幂等）" "204" "$BC_UNK2"
+
+# 19.6–19.11 D（跨站）：同一次登录(sid)在两个 app 建立会话，撤销该 sid 后两个会话都失效；
+# 另一个 sid 的会话不受影响（不误杀）。
+curl -sS "http://$SSO_ADDR/-/sid?sid=selftest-sid-A" >/dev/null
+SID_GA="$(login_app "$HOST_A" __Host-appa_session g_a)"
+SID_GB="$(login_app "$HOST_B" __Host-appb_session g_b)"
+curl -sS "http://$SSO_ADDR/-/sid?sid=selftest-sid-B" >/dev/null
+SID_GV="$(login_app "$HOST_V2" __Host-appv2_session g_v)"
+echo "global-logout sids: a=${SID_GA:0:8}... b=${SID_GB:0:8}... v2=${SID_GV:0:8}..."
+
+check_eq "19.6 撤销前 A 可用 200" "200" "$(me_status "$HOST_A" __Host-appa_session "$SID_GA")"
+check_eq "19.7 撤销前 B 可用 200" "200" "$(me_status "$HOST_B" __Host-appb_session "$SID_GB")"
+
+BC_D="$(bc_post '{"sid":"selftest-sid-A","sub":"mock-user-1"}')"
+echo "back-channel revoke sid A: $BC_D"
+check_eq "19.8 back-channel 撤销 sid A → 204" "204" "$BC_D"
+check_eq "19.9 撤销后 A 会话已删 401" "401" "$(me_status "$HOST_A" __Host-appa_session "$SID_GA")"
+check_eq "19.10 撤销后 B 会话已删 401（跨站）" "401" "$(me_status "$HOST_B" __Host-appb_session "$SID_GB")"
+check_eq "19.11 另一 sid 的 V2 会话不受影响 200" "200" "$(me_status "$HOST_V2" __Host-appv2_session "$SID_GV")"
+check_contains "19.12 审计含 back-channel 登出记录" '"result":"ok:backchannel"' "$(cat "$TMP/audit.log")"
+
+# 19.13/19.14 issuer discovery 连接被断（不可达）→ 登出回退本地 LogoutRedirect（不把用户丢到错误页）
+curl -sS "http://$SSO_ADDR/-/discovery-mode?close=1" >/dev/null
+PROBE_SID="$(login_app "$HOST_A" __Host-appa_session g_p)"
+L5TIME="$(curl -sS --max-time 10 -o /dev/null -D "$TMP/p1.hdr" -w '%{time_total}' \
+  -H "Host: $HOST_A" -H "Cookie: __Host-appa_session=$PROBE_SID" "http://$GW_ADDR/_auth/logout")"
+curl -sS "http://$SSO_ADDR/-/discovery-mode?close=0" >/dev/null
+cat "$TMP/p1.hdr"
+echo "issuer-unreachable logout time=${L5TIME}s"
+check_eq "19.13 探活失败登出仍 302" "302" "$(status_of "$TMP/p1.hdr")"
+check_eq "19.14 探活失败回退本地 LogoutRedirect" "/" "$(header_value "$TMP/p1.hdr" Location)"
+
+# 19.15/19.16 discovery 返回 5xx 仍算可达 → 正常跳 /end_session
+curl -sS "http://$SSO_ADDR/-/discovery-mode?status=500" >/dev/null
+PROBE2_SID="$(login_app "$HOST_A" __Host-appa_session g_p2)"
+curl -sS -o /dev/null -D "$TMP/p2.hdr" -H "Host: $HOST_A" \
+  -H "Cookie: __Host-appa_session=$PROBE2_SID" "http://$GW_ADDR/_auth/logout"
+curl -sS "http://$SSO_ADDR/-/discovery-mode?status=0" >/dev/null
+check_eq "19.15 探活 5xx 仍视为可达 302" "302" "$(status_of "$TMP/p2.hdr")"
+check_contains "19.16 5xx 可达仍跳 /end_session" "/end_session?" "$(header_value "$TMP/p2.hdr" Location)"
+
+# 19.17–19.19 backchannel.enabled=false → 端点 404，且单站登出行为完全正常
+sed -e "s#listen: ${GW_ADDR}#listen: ${BC_ADDR}#" -e 's#enabled: true#enabled: false#' \
+  "$TMP/config.yaml" > "$TMP/disabled.yaml"
+printf '$ %s/auth-gateway -config %s/disabled.yaml   # backchannel.enabled=false\n' "$TMP" "$TMP"
+"$TMP/bin/auth-gateway" -config "$TMP/disabled.yaml" >"$TMP/gateway-disabled.log" 2>&1 &
+BCGW_PID=$!
+for _ in $(seq 1 50); do
+  curl -fsS "http://$BC_ADDR/-/health" >/dev/null 2>&1 && break
+  sleep 0.1
+done
+BC_OFF="$(curl -sS -o /dev/null -w '%{http_code}' -X POST -H "X-Internal-Token: $BC_TOKEN" \
+  -H 'Content-Type: application/json' --data '{"sid":"x"}' "http://$BC_ADDR/_auth/backchannel-logout")"
+echo "disabled endpoint: $BC_OFF"
+check_eq "19.17 enabled=false 端点 → 404" "404" "$BC_OFF"
+DSID="$(login_app "$HOST_A" __Host-appa_session g_d)"
+curl -sS -o /dev/null -D "$TMP/p3.hdr" -H "Host: $HOST_A" \
+  -H "Cookie: __Host-appa_session=$DSID" "http://$BC_ADDR/_auth/logout"
+cat "$TMP/p3.hdr"
+check_eq "19.18 enabled=false 时单站登出仍 302" "302" "$(status_of "$TMP/p3.hdr")"
+check_contains "19.19 enabled=false 时仍跳 /end_session" "/end_session?" "$(header_value "$TMP/p3.hdr" Location)"
 
 # ── summary ──────────────────────────────────────────────────────────────
 
