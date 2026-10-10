@@ -234,25 +234,88 @@ func (g *Gateway) handleCallback(w http.ResponseWriter, r *http.Request) {
 
 // ── logout ───────────────────────────────────────────────────────────────
 
+// logoutRevokeTimeout bounds the best-effort token revocation so a slow or
+// dead issuer can never drag the logout response out.
+const logoutRevokeTimeout = 3 * time.Second
+
+// revokeResult summarises the best-effort token revocations performed during
+// logout. attempted counts tokens we tried to revoke; succeeded counts the
+// calls the issuer accepted.
+type revokeResult struct {
+	attempted int
+	succeeded int
+}
+
+// auditResult reports "ok", or "ok:revoke_error" when some (or all) revocation
+// attempts failed. The logout itself still succeeds.
+func (r revokeResult) auditResult() string {
+	if r.attempted == 0 || r.succeeded == r.attempted {
+		return "ok"
+	}
+	return "ok:revoke_error"
+}
+
+// revokeSessionTokens revokes the session's refresh and access tokens with the
+// issuer. Revocation is best effort and independent of mode: any token actually
+// present in the session is attempted. Failures are logged (never with token
+// values) and never abort the logout.
+func (g *Gateway) revokeSessionTokens(ctx context.Context, app *appRoute, sess session.Session) revokeResult {
+	var res revokeResult
+	ctx, cancel := context.WithTimeout(ctx, logoutRevokeTimeout)
+	defer cancel()
+	for _, tok := range []string{sess.RefreshToken, sess.AccessToken} {
+		if strings.TrimSpace(tok) == "" {
+			continue
+		}
+		res.attempted++
+		if err := g.provider.Revoke(ctx, app.cfg.ID, app.cfg.ClientSecret, tok); err != nil {
+			g.logf.Printf("logout: revoke token: %v", err)
+			continue
+		}
+		res.succeeded++
+	}
+	return res
+}
+
+// endSessionTarget decides where logout sends the browser. The happy path is
+// the issuer's /end_session endpoint carrying the site's absolute return URL,
+// which lets the browser end the auth-centre SSO session. The local logout page
+// is the fallback when the return URL cannot be built from configuration or
+// when every revocation attempt failed (the issuer is unreachable or rejecting,
+// so redirecting the browser there would only show a broken page).
+func (g *Gateway) endSessionTarget(app *appRoute, revoke revokeResult) (string, bool) {
+	if revoke.attempted > 0 && revoke.succeeded == 0 {
+		return "", false
+	}
+	site, ok := app.cfg.SiteURL(g.cfg.LogoutRedirect)
+	if !ok {
+		return "", false
+	}
+	return g.provider.EndSessionURL(app.cfg.ID, site), true
+}
+
 func (g *Gateway) handleLogout(w http.ResponseWriter, r *http.Request) {
 	app := g.appForRequest(r)
 	if app == nil {
 		http.Error(w, "unknown host", http.StatusNotFound)
 		return
 	}
+	var revoke revokeResult
 	sid := session.ReadSessionCookie(r, app.cookieName)
 	if sid != "" {
 		if sess, ok, err := g.store.GetSession(sid); err == nil && ok {
-			if app.cfg.Mode == config.ModeProxy && sess.RefreshToken != "" {
-				_ = g.provider.Revoke(r.Context(), app.cfg.ID, app.cfg.ClientSecret, sess.RefreshToken)
-			}
-			g.audit.Log(app.cfg.ID, sess.Sub, "logout", "ok")
+			revoke = g.revokeSessionTokens(r.Context(), app, sess)
+			g.audit.Log(app.cfg.ID, sess.Sub, "logout", revoke.auditResult())
 		}
 		if err := g.store.DeleteSession(sid); err != nil {
 			g.logf.Printf("logout: delete session: %v", err)
 		}
 	}
 	session.ClearSessionCookie(w, app.cookieName)
+	if target, ok := g.endSessionTarget(app, revoke); ok {
+		http.Redirect(w, r, target, http.StatusFound)
+		return
+	}
 	http.Redirect(w, r, g.cfg.LogoutRedirect, http.StatusFound)
 }
 
